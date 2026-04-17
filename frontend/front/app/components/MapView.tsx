@@ -47,14 +47,21 @@ function MapView({ routes, selectedRoute, showHeatmap, darkMode }: MapViewProps)
       zoom={13}
       zoomControl={false}
       preferCanvas={true}
-      style={{ height: '100vh', width: '100%', zIndex: 0 }}
+      style={{
+        height: '100vh',
+        width: '100%',
+        zIndex: 0,
+        filter: darkMode
+          ? "brightness(0.85) contrast(1.1)"
+          : "saturate(0.65) brightness(1.05)"
+      }}
     >
       <TileLayer
         attribution="&copy; OpenStreetMap contributors"
         url={
           darkMode
             ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-            : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            : "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
         }
         keepBuffer={2}
       />
@@ -66,17 +73,29 @@ function MapView({ routes, selectedRoute, showHeatmap, darkMode }: MapViewProps)
             positions={baseRoute}
             pathOptions={{
               color: darkMode ? "#60a5fa" : route.color,
-              weight: route.id === selectedRoute ? 7 : 3,
-              opacity: route.id === selectedRoute ? 1 : 0.5,
+              weight: route.id === selectedRoute ? 8 : 4,
+              opacity: route.id === selectedRoute ? 1 : 0.4,
             }}
           />
         ))}
 
       {showHeatmap && (
         <>
-          <Circle center={[12.9716, 77.5946]} radius={500} pathOptions={{ color: 'green', fillOpacity: 0.2 }} />
-          <Circle center={[12.9680, 77.6000]} radius={400} pathOptions={{ color: 'yellow', fillOpacity: 0.2 }} />
-          <Circle center={[12.9650, 77.5800]} radius={300} pathOptions={{ color: 'red', fillOpacity: 0.2 }} />
+          <Circle
+            center={[12.9716, 77.5946]}
+            radius={500}
+            pathOptions={{ color: 'green', fillOpacity: 0.15 }}
+          />
+          <Circle
+            center={[12.9680, 77.6000]}
+            radius={400}
+            pathOptions={{ color: 'yellow', fillOpacity: 0.15 }}
+          />
+          <Circle
+            center={[12.9650, 77.5800]}
+            radius={300}
+            pathOptions={{ color: 'red', fillOpacity: 0.15 }}
+          />
         </>
       )}
     </MapContainer>
