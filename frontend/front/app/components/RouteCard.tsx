@@ -27,55 +27,55 @@ export default function RouteCard({ route, isSelected, onClick, delay }: RouteCa
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay, duration: 0.25 }}
       onClick={onClick}
-      className={`w-full text-left rounded-lg p-3 transition-all duration-200 ${
+      className={`w-full text-left rounded-xl p-3 transition-all duration-200 ${
         isSelected
-          ? 'bg-blue-50 border-2 border-blue-500 shadow-sm scale-[1.01]'
-          : 'bg-gray-50 border border-gray-200 hover:border-gray-300'
+          ? 'bg-white/20 backdrop-blur-md border border-blue-400/50 shadow-lg scale-[1.02]'
+          : 'bg-white/10 backdrop-blur-md border border-white/20 hover:bg-white/15'
       }`}
     >
       <div className="flex items-start justify-between mb-2.5">
         <div className="flex items-center gap-2">
           <div
-            className="w-3 h-3 rounded-full flex-shrink-0"
+            className="w-3 h-3 rounded-full"
             style={{ backgroundColor: route.color }}
           />
-          <span className="font-semibold text-gray-900 text-sm">
+          <span className="font-semibold text-white/90 text-sm">
             {route.label}
           </span>
         </div>
 
         <Navigation2
-          className={`w-3.5 h-3.5 transition-opacity ${
-            isSelected ? 'text-blue-600 opacity-100' : 'opacity-0'
+          className={`w-3.5 h-3.5 ${
+            isSelected ? 'text-blue-400 opacity-100' : 'opacity-0'
           }`}
         />
       </div>
 
-      <div className="flex items-center gap-4 mb-2.5 text-xs text-gray-600">
+      <div className="flex items-center gap-4 mb-2.5 text-xs text-white/60">
         <div className="flex items-center gap-1.5">
           <Clock className="w-3.5 h-3.5" />
           <span>{route.time}</span>
         </div>
-        <div className="text-gray-400">•</div>
+        <div className="text-white/40">•</div>
         <span>{route.distance}</span>
       </div>
 
       <div>
-        <div className="flex items-center justify-between mb-1">
-          <div className="flex items-center gap-1.5 text-xs text-gray-600">
+        <div className="flex items-center justify-between mb-1 text-xs">
+          <div className="flex items-center gap-1.5 text-white/60">
             <Signal className="w-3 h-3" />
             <span>Coverage</span>
           </div>
-          <span className="text-xs font-semibold text-gray-900">
+          <span className="text-white/90 font-semibold">
             {connectivityPercentage}%
           </span>
         </div>
 
-        <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+        <div className="h-1.5 bg-white/20 rounded-full overflow-hidden">
           <motion.div
             initial={{ width: 0 }}
             animate={{ width: `${connectivityPercentage}%` }}
-            transition={{ duration: 0.6, ease: 'easeOut' }}
+            transition={{ duration: 0.6 }}
             className="h-full rounded-full"
             style={{ backgroundColor: route.color }}
           />

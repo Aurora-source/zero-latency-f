@@ -58,10 +58,11 @@ function MapView({ routes, selectedRoute, showHeatmap }: MapViewProps) {
       style={{ height: '100vh', width: '100%', zIndex: 0 }}
     >
       <TileLayer
-        attribution="&copy; OpenStreetMap & Carto"
-        url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+        attribution="&copy; OpenStreetMap contributors"
+        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         updateWhenZooming={false}
         updateWhenIdle={true}
+        keepBuffer={2}
       />
 
       {baseRoute.length > 0 &&
@@ -79,9 +80,9 @@ function MapView({ routes, selectedRoute, showHeatmap }: MapViewProps) {
 
       {showHeatmap && (
         <>
-          <Circle center={[12.9716, 77.5946]} radius={500} pathOptions={{ color: 'green', fillOpacity: 0.3 }} />
-          <Circle center={[12.9680, 77.6000]} radius={400} pathOptions={{ color: 'yellow', fillOpacity: 0.3 }} />
-          <Circle center={[12.9650, 77.5800]} radius={300} pathOptions={{ color: 'red', fillOpacity: 0.3 }} />
+          <Circle center={[12.9716, 77.5946]} radius={500} pathOptions={{ color: 'green', fillOpacity: 0.25 }} />
+          <Circle center={[12.9680, 77.6000]} radius={400} pathOptions={{ color: 'yellow', fillOpacity: 0.25 }} />
+          <Circle center={[12.9650, 77.5800]} radius={300} pathOptions={{ color: 'red', fillOpacity: 0.25 }} />
         </>
       )}
     </MapContainer>
