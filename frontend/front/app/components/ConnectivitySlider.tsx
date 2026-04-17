@@ -33,15 +33,18 @@ export default function ConnectivitySlider({ value, onChange }: ConnectivitySlid
       </div>
 
       <div className="relative flex bg-white/10 backdrop-blur-xl rounded-full p-1 border border-white/20 overflow-hidden">
+
+        {/* Sliding indicator */}
         <motion.div
           className="absolute top-1 bottom-1 bg-white rounded-full shadow"
           animate={{
-            left: `calc(${index * 33.33}% + 4px)`,
-            width: "calc(33.33% - 8px)"
+            left: `calc(${index * 33.333}% + 4px)`,
+            width: "calc(33.333% - 8px)"
           }}
           transition={{ type: "spring", stiffness: 400, damping: 30 }}
         />
 
+        {/* Buttons */}
         {["fast", "balanced", "connected"].map((m, i) => (
           <button
             key={m}

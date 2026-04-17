@@ -1,6 +1,5 @@
 import { useState, useEffect } from 'react';
-import { motion } from 'framer-motion';
-import { Search, Layers, Navigation, AlertTriangle } from 'lucide-react';
+import { Search, Layers, Navigation, AlertTriangle, Sun, Moon } from 'lucide-react';
 import MapView from './components/MapView';
 import RouteCard from './components/RouteCard';
 import ConnectivitySlider from './components/ConnectivitySlider';
@@ -10,6 +9,10 @@ export default function App() {
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [selectedRoute, setSelectedRoute] = useState(1);
   const [connectivityWeight, setConnectivityWeight] = useState(50);
+  const [darkMode, setDarkMode] = useState(false);
+
+  const [start, setStart] = useState("Downtown Tech Hub, San Francisco");
+  const [destination, setDestination] = useState("Silicon Valley Research Center");
 
   const generateRoutes = (weight: number) => {
     return [
@@ -56,71 +59,87 @@ export default function App() {
     else setSelectedRoute(1);
   }, [connectivityWeight]);
 
-  return (
-    <div className="size-full bg-black relative overflow-hidden" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+  useEffect(() => {
+    const delay = setTimeout(() => {
+      if (destination.trim() !== "") {
+        console.log("Trigger routing:", start, "→", destination);
+      }
+    }, 600);
 
-      
+    return () => clearTimeout(delay);
+  }, [destination, start]);
+
+  return (
+    <div className="size-full bg-black relative overflow-hidden">
 
       <MapView
         routes={routes}
         selectedRoute={selectedRoute}
         showHeatmap={showHeatmap}
+        darkMode={darkMode}
       />
 
-      <motion.div
-        initial={{ y: -20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        transition={{ duration: 0.4 }}
-        className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-2xl px-4 z-30"
-      >
-        <div className="bg-black/30 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-3">
+      {/* TOP RIGHT COMPACT DARK MODE TOGGLE */}
+      <div className="absolute top-4 right-4 z-30">
+        <button
+          onClick={() => setDarkMode(!darkMode)}
+          className="flex items-center gap-2 bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl px-3 py-2 shadow-lg"
+        >
+          <Sun className={`w-4 h-4 ${!darkMode ? 'text-yellow-300' : 'text-white/40'}`} />
+          <div className="w-8 h-4 rounded-full bg-white/20 relative">
+            <div
+              className="absolute top-0.5 left-0.5 w-3 h-3 bg-white rounded-full"
+              style={{
+                transform: `translateX(${darkMode ? '14px' : '0px'})`,
+                transition: 'transform 0.2s ease'
+              }}
+            />
+          </div>
+          <Moon className={`w-4 h-4 ${darkMode ? 'text-blue-300' : 'text-white/40'}`} />
+        </button>
+      </div>
+
+      {/* SEARCH BAR */}
+      <div className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-2xl px-4 z-20">
+        <div className="bg-black/40 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-2">
           <div className="flex items-center gap-2">
 
-            <div className="flex-1 flex items-center gap-2 bg-white/20 rounded px-3 py-2.5 border border-white/10">
-              <Navigation className="w-4 h-4 text-white/60" />
+            <div className="flex-1 flex items-center gap-3 bg-white/10 rounded-xl px-4 py-3 border border-white/10">
+              <Navigation className="w-4 h-4 text-blue-400" />
               <input
                 type="text"
-                placeholder="Start Location"
-                defaultValue="Downtown Tech Hub, San Francisco"
+                value={start}
+                onChange={(e) => setStart(e.target.value)}
                 className="flex-1 bg-transparent text-white placeholder:text-white/50 outline-none text-sm"
               />
             </div>
 
-            <div className="flex-1 flex items-center gap-2 bg-white/20 rounded px-3 py-2.5 border border-white/10">
+            <div className="w-px h-6 bg-white/10" />
+
+            <div className="flex-1 flex items-center gap-3 bg-white/10 rounded-xl px-4 py-3 border border-white/10">
               <Search className="w-4 h-4 text-white/60" />
               <input
                 type="text"
-                placeholder="Destination"
-                defaultValue="Silicon Valley Research Center"
+                value={destination}
+                onChange={(e) => setDestination(e.target.value)}
                 className="flex-1 bg-transparent text-white placeholder:text-white/50 outline-none text-sm"
               />
             </div>
 
-            <button className="px-5 py-2.5 bg-blue-500/80 backdrop-blur-md rounded text-white text-sm font-medium">
-              Search
-            </button>
-
           </div>
         </div>
-      </motion.div>
+      </div>
 
-      <motion.div
-        initial={{ x: -30, opacity: 0 }}
-        animate={{ x: 0, opacity: 1 }}
-        transition={{ duration: 0.4 }}
-        className="absolute left-4 top-24 w-[380px] z-20 space-y-3"
-      >
+      {/* LEFT PANEL */}
+      <div className="absolute left-4 top-24 w-[380px] z-20 space-y-3">
+
         <div className="bg-black/30 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-4">
-          <h3 className="font-semibold text-white/90 mb-4 text-sm">
-            Routing Priority
-          </h3>
+          <h3 className="text-white/90 mb-4 text-sm">Routing Priority</h3>
           <ConnectivitySlider value={connectivityWeight} onChange={setConnectivityWeight} />
         </div>
 
         <div className="bg-black/30 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-4">
-          <h3 className="font-semibold text-white/90 mb-3 text-sm">
-            Available Routes
-          </h3>
+          <h3 className="text-white/90 mb-3 text-sm">Available Routes</h3>
 
           <div className="space-y-2">
             {routes.map((route, index) => (
@@ -140,53 +159,40 @@ export default function App() {
         </div>
 
         {routes[selectedRoute]?.warning && (
-          <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="bg-amber-500/10 backdrop-blur-md rounded-2xl border border-amber-300/20 p-3"
-          >
+          <div className="bg-amber-500/10 backdrop-blur-md rounded-2xl border border-amber-300/20 p-3">
             <div className="flex items-start gap-2">
               <AlertTriangle className="w-4 h-4 text-amber-300 mt-0.5" />
               <div>
-                <p className="text-amber-200 text-xs font-medium mb-1">
-                  Network Warning
-                </p>
+                <p className="text-amber-200 text-xs mb-1">Network Warning</p>
                 <p className="text-amber-300 text-xs">
                   {routes[selectedRoute].warning}
                 </p>
               </div>
             </div>
-          </motion.div>
+          </div>
         )}
-      </motion.div>
+      </div>
 
-      <motion.div
-        initial={{ y: 20, opacity: 0 }}
-        animate={{ y: 0, opacity: 1 }}
-        className="absolute bottom-4 right-4 z-20 space-y-3"
-      >
+      {/* BOTTOM RIGHT */}
+      <div className="absolute bottom-4 right-4 z-20 space-y-3">
+
         <div className="bg-black/30 backdrop-blur-xl rounded-2xl border border-white/10 shadow-lg p-3">
-          <button
-            onClick={() => setShowHeatmap(!showHeatmap)}
-            className="flex items-center gap-2.5 w-full"
-          >
+          <button onClick={() => setShowHeatmap(!showHeatmap)} className="flex items-center gap-2 w-full">
             <div className={`w-10 h-5 rounded-full relative ${showHeatmap ? 'bg-blue-500' : 'bg-white/30'}`}>
-              <motion.div
-                animate={{ x: showHeatmap ? 20 : 0 }}
-                transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+              <div
                 className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white"
+                style={{
+                  transform: `translateX(${showHeatmap ? '20px' : '0px'})`,
+                  transition: 'transform 0.2s ease'
+                }}
               />
             </div>
-
-            <div className="flex items-center gap-2 text-white/80 text-sm font-medium">
-              <Layers className="w-4 h-4" />
-              <span>Network Heatmap</span>
-            </div>
+            <span className="text-white/80 text-sm">Network Heatmap</span>
           </button>
         </div>
 
         {showHeatmap && <Legend />}
-      </motion.div>
+      </div>
     </div>
   );
 }
