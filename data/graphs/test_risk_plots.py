@@ -3,7 +3,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 
 # 1. Load your existing Chennai graph
-G = ox.load_graphml("./data/graphs/chennai.graphml")
+G = ox.load_graphml("chennai.graphml")
 
 # 2. Define a "Risk Zone" (e.g., a known flood-prone area in Chennai)
 # Let's say roads near a specific point are 'risky'
