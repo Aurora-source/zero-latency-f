@@ -25,11 +25,11 @@ export default function RouteCard({ route, isSelected, onClick, delay }: RouteCa
     <motion.button
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ delay, duration: 0.3 }}
+      transition={{ delay, duration: 0.25 }}
       onClick={onClick}
-      className={`w-full text-left rounded-lg p-3 transition-all ${
+      className={`w-full text-left rounded-lg p-3 transition-all duration-200 ${
         isSelected
-          ? 'bg-blue-50 border-2 border-blue-500 shadow-sm'
+          ? 'bg-blue-50 border-2 border-blue-500 shadow-sm scale-[1.01]'
           : 'bg-gray-50 border border-gray-200 hover:border-gray-300'
       }`}
     >
@@ -43,9 +43,12 @@ export default function RouteCard({ route, isSelected, onClick, delay }: RouteCa
             {route.label}
           </span>
         </div>
-        {isSelected && (
-          <Navigation2 className="w-3.5 h-3.5 text-blue-600" />
-        )}
+
+        <Navigation2
+          className={`w-3.5 h-3.5 transition-opacity ${
+            isSelected ? 'text-blue-600 opacity-100' : 'opacity-0'
+          }`}
+        />
       </div>
 
       <div className="flex items-center gap-4 mb-2.5 text-xs text-gray-600">
@@ -57,7 +60,6 @@ export default function RouteCard({ route, isSelected, onClick, delay }: RouteCa
         <span>{route.distance}</span>
       </div>
 
-      {/* Connectivity bar */}
       <div>
         <div className="flex items-center justify-between mb-1">
           <div className="flex items-center gap-1.5 text-xs text-gray-600">
@@ -68,11 +70,12 @@ export default function RouteCard({ route, isSelected, onClick, delay }: RouteCa
             {connectivityPercentage}%
           </span>
         </div>
+
         <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
           <motion.div
             initial={{ width: 0 }}
             animate={{ width: `${connectivityPercentage}%` }}
-            transition={{ delay: 0.2 + delay, duration: 0.8, ease: 'easeOut' }}
+            transition={{ duration: 0.6, ease: 'easeOut' }}
             className="h-full rounded-full"
             style={{ backgroundColor: route.color }}
           />
