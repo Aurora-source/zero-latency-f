@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@supabase/supabase-js": "^2.103.3",
     "@tailwindcss/vite": "^4.2.2",
     "@vitejs/plugin-react": "^6.0.1",
     "framer-motion": "^12.38.0",

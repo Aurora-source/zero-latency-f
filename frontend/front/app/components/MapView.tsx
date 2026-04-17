@@ -1,6 +1,7 @@
 import { MapContainer, TileLayer, Polyline, Circle, Marker, useMap } from 'react-leaflet';
 import { useEffect, useState, memo, useRef } from 'react';
 import L from 'leaflet';
+import { type Hotspot } from '../lib/supabase';
 
 interface Route {
   id: number;
@@ -15,6 +16,8 @@ interface MapViewProps {
   darkMode: boolean;
   userLocation: [number, number] | null;
   destinationCoords?: [number, number] | null;
+  routeMode: 'fastest' | 'balanced' | 'connected';
+  hotspots: Hotspot[];
 }
 
 interface GraphNode {
@@ -40,6 +43,45 @@ function haversine(a: GraphNode, b: GraphNode): number {
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
+function hotspotBonus(lat: number, lon: number, hotspots: Hotspot[]): number {
+  if (!hotspots.length) return 1.0;
+
+  let bestScore = 1.0;
+
+  for (const h of hotspots) {
+    const d = haversine({ lat, lon }, { lat: h.lat, lon: h.lon });
+    const radius = h.radius_meters * 3;
+
+    if (d > radius) continue;
+
+    const strengthMultiplier =
+      h.signal_strength === 'strong' ? 0.2 :
+      h.signal_strength === 'medium' ? 0.4 : 0.6;
+
+    const score = strengthMultiplier + ((1 - strengthMultiplier) * (d / radius));
+    if (score < bestScore) bestScore = score;
+  }
+
+  return bestScore;
+}
+
+function edgeWeight(
+  na: GraphNode,
+  nb: GraphNode,
+  mode: 'fastest' | 'balanced' | 'connected',
+  hotspots: Hotspot[]
+): number {
+  const dist = haversine(na, nb);
+  if (mode === 'fastest') return dist;
+
+  const midLat = (na.lat + nb.lat) / 2;
+  const midLon = (na.lon + nb.lon) / 2;
+  const bonus = hotspotBonus(midLat, midLon, hotspots);
+
+  if (mode === 'connected') return dist * bonus;
+  return dist * (0.5 + 0.5 * bonus);
+}
+
 function nearestNode(nodes: Nodes, lat: number, lon: number): number {
   let best = -1;
   let bestDist = Infinity;
@@ -54,7 +96,9 @@ function dijkstra(
   graph: Graph,
   nodes: Nodes,
   startId: number,
-  endId: number
+  endId: number,
+  mode: 'fastest' | 'balanced' | 'connected',
+  hotspots: Hotspot[]
 ): number[] {
   const dist = new Map<number, number>();
   const prev = new Map<number, number>();
@@ -63,8 +107,7 @@ function dijkstra(
   for (const id of nodes.keys()) dist.set(id, Infinity);
   dist.set(startId, 0);
 
-  // Min-heap via sorted array (simple for moderate graph sizes)
-  const queue: [number, number][] = [[0, startId]]; // [cost, nodeId]
+  const queue: [number, number][] = [[0, startId]];
 
   while (queue.length > 0) {
     queue.sort((a, b) => a[0] - b[0]);
@@ -72,12 +115,18 @@ function dijkstra(
 
     if (visited.has(u)) continue;
     visited.add(u);
-
     if (u === endId) break;
+
+    const uNode = nodes.get(u)!;
 
     for (const edge of graph.get(u) ?? []) {
       if (visited.has(edge.to)) continue;
-      const newCost = cost + edge.weight;
+      const vNode = nodes.get(edge.to);
+      if (!vNode) continue;
+
+      const w = edgeWeight(uNode, vNode, mode, hotspots);
+      const newCost = cost + w;
+
       if (newCost < (dist.get(edge.to) ?? Infinity)) {
         dist.set(edge.to, newCost);
         prev.set(edge.to, u);
@@ -86,14 +135,12 @@ function dijkstra(
     }
   }
 
-  // Reconstruct path
   const path: number[] = [];
   let cur: number | undefined = endId;
   while (cur !== undefined) {
     path.unshift(cur);
     cur = prev.get(cur);
   }
-
   return path[0] === startId ? path : [];
 }
 
@@ -123,7 +170,6 @@ async function fetchRoadGraph(
   });
 
   const data = await res.json();
-
   const nodes: Nodes = new Map();
   const graph: Graph = new Map();
 
@@ -187,13 +233,17 @@ function MapView({
   showHeatmap,
   darkMode,
   userLocation,
-  destinationCoords
+  destinationCoords,
+  routeMode,
+  hotspots,
 }: MapViewProps) {
-
   const [routeCoords, setRouteCoords] = useState<[number, number][]>([]);
   const [loading, setLoading] = useState(false);
   const [heading, setHeading] = useState(0);
   const lastPos = useRef<[number, number] | null>(null);
+
+  const graphCache = useRef<{ graph: Graph; nodes: Nodes } | null>(null);
+  const lastEndpoint = useRef<string>('');
 
   useEffect(() => {
     if (!userLocation) return;
@@ -217,22 +267,24 @@ function MapView({
         const [uLat, uLon] = userLocation;
         const [dLat, dLon] = destinationCoords;
 
-        const { graph, nodes } = await fetchRoadGraph(uLat, uLon, dLat, dLon);
+        const endpointKey = `${uLat.toFixed(4)},${uLon.toFixed(4)}-${dLat.toFixed(4)},${dLon.toFixed(4)}`;
+
+        if (!graphCache.current || lastEndpoint.current !== endpointKey) {
+          const fetched = await fetchRoadGraph(uLat, uLon, dLat, dLon);
+          graphCache.current = fetched;
+          lastEndpoint.current = endpointKey;
+        }
+
+        const { graph, nodes } = graphCache.current;
 
         const startId = nearestNode(nodes, uLat, uLon);
         const endId = nearestNode(nodes, dLat, dLon);
 
-        if (startId === -1 || endId === -1) {
-          setLoading(false);
-          return;
-        }
+        if (startId === -1 || endId === -1) return;
 
-        const pathIds = dijkstra(graph, nodes, startId, endId);
+        const pathIds = dijkstra(graph, nodes, startId, endId, routeMode, hotspots);
 
-        if (pathIds.length === 0) {
-          setLoading(false);
-          return;
-        }
+        if (pathIds.length === 0) return;
 
         const coords: [number, number][] = pathIds
           .map(id => nodes.get(id))
@@ -241,14 +293,14 @@ function MapView({
 
         setRouteCoords(coords);
       } catch (err) {
-        console.error('Dijkstra route failed:', err);
+        console.error('Route failed:', err);
       } finally {
         setLoading(false);
       }
     };
 
     run();
-  }, [userLocation, destinationCoords]);
+  }, [userLocation, destinationCoords, routeMode, hotspots]);
 
   const selectedColor = routes.find(r => r.id === selectedRoute)?.color ?? '#8b5cf6';
 
@@ -285,9 +337,7 @@ function MapView({
         font-size: 12px;
         white-space: nowrap;
         transform: translate(-50%, -50%);
-      ">
-        Calculating route...
-      </div>
+      ">Calculating route...</div>
     `,
   });
 
@@ -321,38 +371,29 @@ function MapView({
       {routeCoords.length > 0 && (
         <>
           <FitBounds coords={routeCoords} />
-          <Polyline
-            positions={routeCoords}
-            pathOptions={{ color: '#000000', weight: 10, opacity: 0.15 }}
-          />
-          <Polyline
-            positions={routeCoords}
-            pathOptions={{ color: selectedColor, weight: 6, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }}
-          />
-          <Polyline
-            positions={routeCoords}
-            pathOptions={{ color: '#ffffff', weight: 2, opacity: 0.4, lineCap: 'round', lineJoin: 'round' }}
-          />
+          <Polyline positions={routeCoords} pathOptions={{ color: '#000000', weight: 10, opacity: 0.15 }} />
+          <Polyline positions={routeCoords} pathOptions={{ color: selectedColor, weight: 6, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }} />
+          <Polyline positions={routeCoords} pathOptions={{ color: '#ffffff', weight: 2, opacity: 0.4, lineCap: 'round', lineJoin: 'round' }} />
         </>
       )}
 
       {userLocation && <Marker position={userLocation} icon={carIcon} />}
+      {loading && userLocation && <Marker position={userLocation} icon={loadingIcon} />}
+      {destinationCoords && <Marker position={destinationCoords} icon={destinationIcon} />}
 
-      {loading && userLocation && (
-        <Marker position={userLocation} icon={loadingIcon} />
-      )}
-
-      {destinationCoords && (
-        <Marker position={destinationCoords} icon={destinationIcon} />
-      )}
-
-      {showHeatmap && (
-        <>
-          <Circle center={[12.9716, 77.5946]} radius={500} pathOptions={{ color: 'green', fillOpacity: 0.15 }} />
-          <Circle center={[12.9680, 77.6000]} radius={400} pathOptions={{ color: 'yellow', fillOpacity: 0.15 }} />
-          <Circle center={[12.9650, 77.5800]} radius={300} pathOptions={{ color: 'red', fillOpacity: 0.15 }} />
-        </>
-      )}
+      {showHeatmap && hotspots.map(h => (
+        <Circle
+          key={h.id}
+          center={[h.lat, h.lon]}
+          radius={h.radius_meters}
+          pathOptions={{
+            color: h.signal_strength === 'strong' ? 'green'
+                 : h.signal_strength === 'medium' ? 'yellow'
+                 : 'red',
+            fillOpacity: 0.15
+          }}
+        />
+      ))}
     </MapContainer>
   );
 }

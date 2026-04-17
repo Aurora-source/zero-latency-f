@@ -4,12 +4,15 @@ import MapView from './components/MapView';
 import RouteCard from './components/RouteCard';
 import ConnectivitySlider from './components/ConnectivitySlider';
 import Legend from './components/Legend';
+import { fetchHotspots, type Hotspot } from './lib/supabase';
 
 export default function App() {
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [selectedRoute, setSelectedRoute] = useState(1);
   const [connectivityWeight, setConnectivityWeight] = useState(50);
   const [darkMode, setDarkMode] = useState(false);
+  const [routeMode, setRouteMode] = useState<'fastest' | 'balanced' | 'connected'>('balanced');
+  const [hotspots, setHotspots] = useState<Hotspot[]>([]);
 
   const [start, setStart] = useState("Detecting location...");
   const [destination, setDestination] = useState("");
@@ -19,14 +22,15 @@ export default function App() {
   const [destinationCoords, setDestinationCoords] = useState<[number, number] | null>(null);
 
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    fetchHotspots().then(setHotspots);
+  }, []);
 
+  useEffect(() => {
+    if (!navigator.geolocation) return;
     navigator.geolocation.getCurrentPosition(async (pos) => {
       const lat = pos.coords.latitude;
       const lon = pos.coords.longitude;
-
       setUserLocation([lat, lon]);
-
       try {
         const res = await fetch(
           `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`
@@ -42,21 +46,16 @@ export default function App() {
       setSearchResults([]);
       return;
     }
-
     const delay = setTimeout(async () => {
       try {
         let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(destination)}&limit=8&lang=en`;
-
         if (userLocation) {
           const [lat, lon] = userLocation;
           url += `&lat=${lat}&lon=${lon}`;
         }
-
         const res = await fetch(url);
         const data = await res.json();
-
         const features = data?.features ?? [];
-
         const results = features
           .filter((f: any) => {
             if (!userLocation) return true;
@@ -73,13 +72,11 @@ export default function App() {
               lon: String(f.geometry.coordinates[0]),
             };
           });
-
         setSearchResults(results.slice(0, 6));
       } catch (err) {
         console.error(err);
       }
     }, 300);
-
     return () => clearTimeout(delay);
   }, [destination, userLocation]);
 
@@ -125,19 +122,24 @@ export default function App() {
     setRoutes(generateRoutes(connectivityWeight));
   }, [connectivityWeight]);
 
-  // Slider → route card sync
   useEffect(() => {
     if (connectivityWeight < 40) setSelectedRoute(2);
     else if (connectivityWeight > 60) setSelectedRoute(0);
     else setSelectedRoute(1);
   }, [connectivityWeight]);
 
-  // Route card → slider sync
   const handleRouteSelect = (routeId: number) => {
     setSelectedRoute(routeId);
-    if (routeId === 0) setConnectivityWeight(80);
-    else if (routeId === 1) setConnectivityWeight(50);
-    else if (routeId === 2) setConnectivityWeight(20);
+    if (routeId === 0) {
+      setConnectivityWeight(80);
+      setRouteMode('connected');
+    } else if (routeId === 1) {
+      setConnectivityWeight(50);
+      setRouteMode('balanced');
+    } else if (routeId === 2) {
+      setConnectivityWeight(20);
+      setRouteMode('fastest');
+    }
   };
 
   return (
@@ -150,6 +152,8 @@ export default function App() {
         darkMode={darkMode}
         userLocation={userLocation}
         destinationCoords={destinationCoords}
+        routeMode={routeMode}
+        hotspots={hotspots}
       />
 
       <div className="absolute top-4 right-4 z-30">
@@ -164,7 +168,6 @@ export default function App() {
       <div className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-2xl px-4 z-20">
         <div className="bg-black/40 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-2">
           <div className="flex items-center gap-2">
-
             <div className="flex-1 flex items-center gap-3 bg-white/10 rounded-xl px-4 py-3">
               <Navigation className="w-4 h-4 text-blue-400" />
               <input
@@ -203,7 +206,6 @@ export default function App() {
                 </div>
               )}
             </div>
-
           </div>
         </div>
       </div>
@@ -257,7 +259,6 @@ export default function App() {
             />
           </button>
         </div>
-
         {showHeatmap && <Legend />}
       </div>
     </div>
