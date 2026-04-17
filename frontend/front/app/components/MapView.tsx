@@ -1,5 +1,5 @@
-import { MapContainer, TileLayer, Polyline, Circle, Marker } from 'react-leaflet';
-import { useEffect, useState, memo } from 'react';
+import { MapContainer, TileLayer, Polyline, Circle, Marker, useMap } from 'react-leaflet';
+import { useEffect, useState, memo, useRef } from 'react';
 import L from 'leaflet';
 
 interface Route {
@@ -13,66 +13,124 @@ interface MapViewProps {
   selectedRoute: number;
   showHeatmap: boolean;
   darkMode: boolean;
+  userLocation: [number, number] | null;
+  destinationCoords?: [number, number] | null;
 }
 
-function MapView({ routes, selectedRoute, showHeatmap, darkMode }: MapViewProps) {
-  const [baseRoute, setBaseRoute] = useState<[number, number][]>([]);
-  const [userLocation, setUserLocation] = useState<[number, number] | null>(null);
+function FitBounds({ coords }: { coords: [number, number][] }) {
+  const map = useMap();
 
-  const start = { lat: 12.9716, lng: 77.5946 };
-  const end = { lat: 12.9800, lng: 77.6100 };
-
-  // 📍 GET USER LOCATION (safe, no breaking)
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    if (coords.length < 2) return;
+    const bounds = L.latLngBounds(coords);
+    map.fitBounds(bounds, { padding: [60, 60] });
+  }, [coords, map]);
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setUserLocation([pos.coords.latitude, pos.coords.longitude]);
-      },
-      (err) => {
-        console.warn("Location denied:", err);
-      }
-    );
-  }, []);
+  return null;
+}
 
-  // 🚗 FETCH ROUTE
+function RecenterOnUser({ userLocation }: { userLocation: [number, number] | null }) {
+  const map = useMap();
+  const hasCentered = useRef(false);
+
   useEffect(() => {
+    if (!userLocation || hasCentered.current) return;
+    map.setView(userLocation, 15);
+    hasCentered.current = true;
+  }, [userLocation, map]);
+
+  return null;
+}
+
+function MapView({
+  routes,
+  selectedRoute,
+  showHeatmap,
+  darkMode,
+  userLocation,
+  destinationCoords
+}: MapViewProps) {
+
+  const [routeCoords, setRouteCoords] = useState<[number, number][]>([]);
+  const [heading, setHeading] = useState(0);
+  const lastPos = useRef<[number, number] | null>(null);
+
+  useEffect(() => {
+    if (!userLocation) return;
+    if (lastPos.current) {
+      const [prevLat, prevLon] = lastPos.current;
+      const [lat, lon] = userLocation;
+      const angle = (Math.atan2(lon - prevLon, lat - prevLat) * 180) / Math.PI;
+      setHeading(angle);
+    }
+    lastPos.current = userLocation;
+  }, [userLocation]);
+
+  useEffect(() => {
+    if (!userLocation || !destinationCoords) {
+      setRouteCoords([]);
+      return;
+    }
+
     const fetchRoute = async () => {
       try {
-        const res = await fetch(
-          `https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson`
-        );
+        const [uLat, uLon] = userLocation;
+        const [dLat, dLon] = destinationCoords;
+
+        const url = `https://router.project-osrm.org/route/v1/driving/${uLon},${uLat};${dLon},${dLat}?overview=full&geometries=geojson`;
+        const res = await fetch(url);
 
         if (!res.ok) return;
-
         const data = await res.json();
-        if (!data?.routes?.[0]) return;
 
-        const coords = data.routes[0].geometry.coordinates.map(
+        if (!data?.routes?.[0]?.geometry?.coordinates) return;
+
+        const coords: [number, number][] = data.routes[0].geometry.coordinates.map(
           ([lng, lat]: [number, number]) => [lat, lng]
         );
 
-        setBaseRoute(coords);
+        setRouteCoords(coords);
       } catch (err) {
-        console.error("Routing error:", err);
+        console.error('Route fetch failed:', err);
       }
     };
 
     fetchRoute();
-  }, []);
+  }, [userLocation, destinationCoords]);
 
-  // 🚘 TOP-DOWN CAR ICON
- const carIcon = L.icon({
-  iconUrl: "https://cdn-icons-png.flaticon.com/512/744/744465.png",
-  iconSize: [32, 32],
-  iconAnchor: [16, 16], // center of icon
-});
+  const selectedColor = routes.find(r => r.id === selectedRoute)?.color ?? '#8b5cf6';
+
+  const carIcon = L.divIcon({
+    className: '',
+    html: `
+      <div style="
+        transform: translate(-50%, -50%) rotate(${heading}deg);
+        transition: transform 0.2s linear;
+      ">
+        <img
+          src="https://cdn-icons-png.flaticon.com/512/744/744465.png"
+          style="width: 32px; height: 32px; filter: drop-shadow(0 0 4px rgba(0,0,0,0.6));"
+        />
+      </div>
+    `,
+  });
+
+  const destinationIcon = L.divIcon({
+    className: '',
+    html: `
+      <div style="transform: translate(-50%, -100%);">
+        <svg width="32" height="40" viewBox="0 0 32 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M16 0C7.163 0 0 7.163 0 16c0 10 16 24 16 24S32 26 32 16C32 7.163 24.837 0 16 0z" fill="#ef4444"/>
+          <circle cx="16" cy="16" r="7" fill="white"/>
+        </svg>
+      </div>
+    `,
+  });
 
   return (
-    <MapContainer 
+    <MapContainer
       center={userLocation || [12.9716, 77.5946]}
-      zoom={13}
+      zoom={15}
       zoomControl={false}
       preferCanvas={true}
       style={{
@@ -80,40 +138,70 @@ function MapView({ routes, selectedRoute, showHeatmap, darkMode }: MapViewProps)
         width: '100%',
         zIndex: 0,
         filter: darkMode
-          ? "brightness(0.85) contrast(1.1)"
-          : "saturate(0.65) brightness(1.05)"
+          ? 'brightness(0.85) contrast(1.1)'
+          : 'saturate(0.65) brightness(1.05)'
       }}
     >
       <TileLayer
         attribution="&copy; OpenStreetMap contributors"
         url={
           darkMode
-            ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-            : "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+            ? 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png'
+            : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
         }
         keepBuffer={2}
       />
 
-      {/* 🚘 USER CAR */}
+      <RecenterOnUser userLocation={userLocation} />
+
+      {routeCoords.length > 0 && (
+        <>
+          <FitBounds coords={routeCoords} />
+
+          {/* Route shadow for depth */}
+          <Polyline
+            positions={routeCoords}
+            pathOptions={{
+              color: '#000000',
+              weight: 10,
+              opacity: 0.15,
+            }}
+          />
+
+          {/* Main route line */}
+          <Polyline
+            positions={routeCoords}
+            pathOptions={{
+              color: selectedColor,
+              weight: 6,
+              opacity: 0.95,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }}
+          />
+
+          {/* Route highlight (inner bright line) */}
+          <Polyline
+            positions={routeCoords}
+            pathOptions={{
+              color: '#ffffff',
+              weight: 2,
+              opacity: 0.4,
+              lineCap: 'round',
+              lineJoin: 'round',
+            }}
+          />
+        </>
+      )}
+
       {userLocation && (
         <Marker position={userLocation} icon={carIcon} />
       )}
 
-      {/* ROUTES */}
-      {baseRoute.length > 0 &&
-        routes.map((route) => (
-          <Polyline
-            key={route.id}
-            positions={baseRoute}
-            pathOptions={{
-              color: darkMode ? "#60a5fa" : route.color,
-              weight: route.id === selectedRoute ? 8 : 4,
-              opacity: route.id === selectedRoute ? 1 : 0.4,
-            }}
-          />
-        ))}
+      {destinationCoords && (
+        <Marker position={destinationCoords} icon={destinationIcon} />
+      )}
 
-      {/* HEATMAP */}
       {showHeatmap && (
         <>
           <Circle center={[12.9716, 77.5946]} radius={500} pathOptions={{ color: 'green', fillOpacity: 0.15 }} />
