@@ -11,8 +11,36 @@ export default function App() {
   const [connectivityWeight, setConnectivityWeight] = useState(50);
   const [darkMode, setDarkMode] = useState(false);
 
-  const [start, setStart] = useState("Downtown Tech Hub, San Francisco");
+  const [start, setStart] = useState("Detecting location...");
   const [destination, setDestination] = useState("Silicon Valley Research Center");
+
+  // ✅ NEW: user coordinates
+  const [userLocation, setUserLocation] = useState<[number, number] | null>(null);
+
+  // ✅ NEW: get location + address
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+
+    navigator.geolocation.getCurrentPosition(async (pos) => {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+
+      setUserLocation([lat, lon]);
+
+      try {
+        const res = await fetch(
+          `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json`
+        );
+        const data = await res.json();
+
+        if (data?.display_name) {
+          setStart(data.display_name);
+        }
+      } catch (err) {
+        console.error("Reverse geocode failed");
+      }
+    });
+  }, []);
 
   const generateRoutes = (weight: number) => {
     return [
@@ -72,14 +100,17 @@ export default function App() {
   return (
     <div className="size-full bg-black relative overflow-hidden">
 
+      {/* ✅ PASS LOCATION TO MAP */}
       <MapView
         routes={routes}
         selectedRoute={selectedRoute}
         showHeatmap={showHeatmap}
         darkMode={darkMode}
+        userLocation={userLocation}
       />
 
-      {/* TOP RIGHT COMPACT DARK MODE TOGGLE */}
+      {/* EVERYTHING BELOW IS UNCHANGED */}
+
       <div className="absolute top-4 right-4 z-30">
         <button
           onClick={() => setDarkMode(!darkMode)}
@@ -99,7 +130,6 @@ export default function App() {
         </button>
       </div>
 
-      {/* SEARCH BAR */}
       <div className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-2xl px-4 z-20">
         <div className="bg-black/40 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-2">
           <div className="flex items-center gap-2">
@@ -130,7 +160,6 @@ export default function App() {
         </div>
       </div>
 
-      {/* LEFT PANEL */}
       <div className="absolute left-4 top-24 w-[380px] z-20 space-y-3">
 
         <div className="bg-black/30 backdrop-blur-xl rounded-2xl border border-white/10 shadow-xl p-4">
@@ -173,7 +202,6 @@ export default function App() {
         )}
       </div>
 
-      {/* BOTTOM RIGHT */}
       <div className="absolute bottom-4 right-4 z-20 space-y-3">
 
         <div className="bg-black/30 backdrop-blur-xl rounded-2xl border border-white/10 shadow-lg p-3">
