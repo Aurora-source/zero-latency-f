@@ -1,0 +1,42 @@
+services:
+  data-service:
+    build:
+      context: ./services/data-service
+    container_name: connectivity-data-service
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./services/data-service/data:/app/data
+
+  routing-engine:
+    build:
+      context: ./services/routing-engine
+    container_name: connectivity-routing-engine
+    depends_on:
+      - data-service
+    ports:
+      - "8002:8002"
+    volumes:
+      - ./services/data-service/data:/app/data
+
+  visualization:
+    build:
+      context: ./services/visualization
+    container_name: connectivity-visualization
+    depends_on:
+      - data-service
+      - routing-engine
+    ports:
+      - "3000:3000"
+
+  gateway:
+    image: nginx:1.27-alpine
+    container_name: connectivity-gateway
+    depends_on:
+      - data-service
+      - routing-engine
+      - visualization
+    ports:
+      - "80:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro

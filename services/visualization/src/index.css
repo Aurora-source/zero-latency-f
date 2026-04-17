@@ -1,0 +1,36 @@
+:root {
+  color-scheme: light;
+  font-family: "Space Grotesk", sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  min-height: 100%;
+  background:
+    radial-gradient(circle at top left, rgba(251, 191, 36, 0.28), transparent 34%),
+    radial-gradient(circle at top right, rgba(59, 130, 246, 0.2), transparent 30%),
+    linear-gradient(135deg, #f8f3ec 0%, #edf4f1 48%, #eef1fb 100%);
+  color: #102033;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+.leaflet-container {
+  height: 100%;
+  width: 100%;
+  background: #d8e3e8;
+  font-family: "Space Grotesk", sans-serif;
+}
+
+.leaflet-control-attribution {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 10px;
+}
