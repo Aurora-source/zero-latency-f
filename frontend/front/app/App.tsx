@@ -131,9 +131,13 @@ export default function App() {
                 key={route.id}
                 route={route}
                 isSelected={selectedRoute === route.id}
-                onClick={() => {}}
-                delay={index * 0.05}
-              />
+              onClick={() => {
+                if (route.id === 0) setConnectivityWeight(100);   // Connected
+                else if (route.id === 1) setConnectivityWeight(50); // Balanced
+                else setConnectivityWeight(0);                    // Fastest
+              }}
+              delay={index * 0.05}
+            />
             ))}
           </div>
         </div>
