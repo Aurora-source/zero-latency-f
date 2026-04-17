@@ -14,7 +14,7 @@ dist_threshold = 500 # meters
 for u, v, k, data in G.edges(data=True, keys=True):
     # Calculate distance from road to risk center
     node_coords = (G.nodes[u]['y'], G.nodes[u]['x'])
-    dist = ox.distance.great_circle_vec(risk_center[0], risk_center[1], node_coords[0], node_coords[1])
+    dist = ox.distance.great_circle(risk_center[0], risk_center[1], node_coords[0], node_coords[1])
     
     # If close to flood zone, triple the weight
     data['risk_weight'] = data['length'] * (3.0 if dist < dist_threshold else 1.0)
