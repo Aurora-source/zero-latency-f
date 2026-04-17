@@ -11,14 +11,23 @@ import osmnx as ox
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from shapely.geometry import LineString
+from shapely.geometry import LineString,point,polygon
 
 CITY_QUERIES = {
     "chennai": "Chennai, Tamil Nadu, India",
     "mumbai": "Mumbai, Maharashtra, India",
     "delhi": "National Capital Territory of Delhi, India",
 }
-
+RISK_ZONES = {
+    "chennai": [
+        {
+            "type": "flood_prone",
+            "penalty_multiplier": 5.0, # Makes this route look 5x slower
+            # A rough bounding box in Chennai
+            "polygon": Polygon([(80.20, 13.04), (80.25, 13.04), (80.25, 13.06), (80.20, 13.06)])
+        }
+    ]
+}
 BASE_DIR = Path(__file__).resolve().parent
 GRAPH_DIR = Path("/app/data/graphs") if Path("/app/data/graphs").exists() else BASE_DIR.parent / "data-service" / "data" / "graphs"
 GRAPH_DIR.mkdir(parents=True, exist_ok=True)
@@ -41,7 +50,7 @@ class RouteRequest(BaseModel):
     city: str
     origin: list[float]
     destination: list[float]
-    mode: Literal["fastest", "connected", "balanced"]
+    mode: Literal["fastest", "connected", "balanced", "safe"]
 
 
 def normalize_city(city: str) -> str:
@@ -140,13 +149,27 @@ def get_prepared_graph(city: str):
     max_time = max(travel_times) if travel_times else 1.0
     spread = max(max_time - min_time, 1e-9)
 
-    for _, _, _, data in graph.edges(keys=True, data=True):
+    for u, _, _, data in graph.edges(keys=True, data=True):
         normalized_time = (float(data["travel_time"]) - min_time) / spread
         score = float(data["connectivity_score"])
+        
+        # 1. Base Weights
         data["weight_fastest"] = float(data["travel_time"])
         data["weight_connected"] = 1.0 - score
         data["weight_balanced"] = 0.5 * normalized_time + 0.5 * (1.0 - score)
-
+        
+        # 2. NEW: Risk-Aware Weight
+        risk_multiplier = 1.0
+        if city_slug in RISK_ZONES:
+            # Check if the road's starting coordinate is inside a risk zone
+            node_point = Point(graph.nodes[u]["x"], graph.nodes[u]["y"])
+            for zone in RISK_ZONES[city_slug]:
+                if zone["polygon"].contains(node_point):
+                    risk_multiplier = zone["penalty_multiplier"]
+                    break # Apply the penalty and stop checking
+        
+        # Multiply the fastest time by the risk multiplier
+        data["weight_safe"] = float(data["travel_time"]) * risk_multiplier
     return graph
 
 
@@ -209,6 +232,7 @@ def route(request: RouteRequest) -> dict[str, Any]:
         "fastest": "weight_fastest",
         "connected": "weight_connected",
         "balanced": "weight_balanced",
+        "safe": "weight_safe",
     }[request.mode]
 
     try:
