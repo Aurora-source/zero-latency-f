@@ -6,6 +6,33 @@ import ConnectivitySlider from './components/ConnectivitySlider';
 import Legend from './components/Legend';
 import { fetchHotspots, type Hotspot } from './lib/supabase';
 
+const Clock = () => {
+  const [time, setTime] = useState("");
+
+  useEffect(() => {
+    const updateTime = () => {
+      const now = new Date();
+      setTime(
+        now.toLocaleTimeString([], {
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      );
+    };
+
+    updateTime();
+    const interval = setInterval(updateTime, 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl px-3 py-2 text-white font-medium text-sm">
+      {time}
+    </div>
+  );
+};
+
 export default function App() {
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [selectedRoute, setSelectedRoute] = useState(1);
@@ -43,7 +70,7 @@ export default function App() {
 
   useEffect(() => {
     if (destination.length < 2) {
-      setSearchResults([]);
+      searchResults.length && setSearchResults([]);
       return;
     }
     const delay = setTimeout(async () => {
@@ -144,25 +171,28 @@ export default function App() {
 
   return (
     <div className="size-full bg-black relative overflow-hidden">
+      <div style={{ position: "relative" }}>
+        <MapView
+          routes={routes}
+          selectedRoute={selectedRoute}
+          showHeatmap={showHeatmap}
+          darkMode={darkMode}
+          userLocation={userLocation}
+          destinationCoords={destinationCoords}
+          routeMode={routeMode}
+          hotspots={hotspots}
+        />
 
-      <MapView
-        routes={routes}
-        selectedRoute={selectedRoute}
-        showHeatmap={showHeatmap}
-        darkMode={darkMode}
-        userLocation={userLocation}
-        destinationCoords={destinationCoords}
-        routeMode={routeMode}
-        hotspots={hotspots}
-      />
-
-      <div className="absolute top-4 right-4 z-30">
-        <button
-          onClick={() => setDarkMode(!darkMode)}
-          className="bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl px-3 py-2"
-        >
-          {darkMode ? <Sun className="text-yellow-300" /> : <Moon className="text-blue-300" />}
-        </button>
+        {/* Top Right Controls Grouped */}
+        <div className="absolute top-4 right-4 z-30 flex items-center gap-3">
+          <Clock />
+          <button
+            onClick={() => setDarkMode(!darkMode)}
+            className="bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl px-3 py-2 flex items-center justify-center"
+          >
+            {darkMode ? <Sun className="text-yellow-300 w-5 h-5" /> : <Moon className="text-blue-300 w-5 h-5" />}
+          </button>
+        </div>
       </div>
 
       <div className="absolute top-4 left-1/2 -translate-x-1/2 w-full max-w-2xl px-4 z-20">
