@@ -149,10 +149,18 @@ export default function App() {
     setRoutes(generateRoutes(connectivityWeight));
   }, [connectivityWeight]);
 
+  // THIS IS THE FIXED BLOCK
   useEffect(() => {
-    if (connectivityWeight < 40) setSelectedRoute(2);
-    else if (connectivityWeight > 60) setSelectedRoute(0);
-    else setSelectedRoute(1);
+    if (connectivityWeight < 40) {
+      setSelectedRoute(2);
+      setRouteMode('fastest');
+    } else if (connectivityWeight > 60) {
+      setSelectedRoute(0);
+      setRouteMode('connected');
+    } else {
+      setSelectedRoute(1);
+      setRouteMode('balanced');
+    }
   }, [connectivityWeight]);
 
   const handleRouteSelect = (routeId: number) => {

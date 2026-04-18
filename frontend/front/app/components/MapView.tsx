@@ -43,26 +43,28 @@ function haversine(a: GraphNode, b: GraphNode): number {
   return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
 }
 
-function hotspotBonus(lat: number, lon: number, hotspots: Hotspot[]): number {
-  if (!hotspots.length) return 1.0;
+function getHotspotPenalty(lat: number, lon: number, hotspots: Hotspot[]): number {
+  if (!hotspots.length) return 2.0;
 
-  let bestScore = 1.0;
+  let bestAvailablePenalty: number | null = null;
 
   for (const h of hotspots) {
     const d = haversine({ lat, lon }, { lat: h.lat, lon: h.lon });
-    const radius = h.radius_meters * 3;
+    
+    if (d <= h.radius_meters * 1.2) {
+      let penalty = 2.0;
+      
+      if (h.signal_strength === 'strong') penalty = 0.05;
+      else if (h.signal_strength === 'medium') penalty = 5.0;
+      else if (h.signal_strength === 'weak') penalty = 50.0;
 
-    if (d > radius) continue;
-
-    const strengthMultiplier =
-      h.signal_strength === 'strong' ? 0.2 :
-      h.signal_strength === 'medium' ? 0.4 : 0.6;
-
-    const score = strengthMultiplier + ((1 - strengthMultiplier) * (d / radius));
-    if (score < bestScore) bestScore = score;
+      if (bestAvailablePenalty === null || penalty < bestAvailablePenalty) {
+        bestAvailablePenalty = penalty;
+      }
+    }
   }
 
-  return bestScore;
+  return bestAvailablePenalty !== null ? bestAvailablePenalty : 2.0;
 }
 
 function edgeWeight(
@@ -72,14 +74,23 @@ function edgeWeight(
   hotspots: Hotspot[]
 ): number {
   const dist = haversine(na, nb);
+  
   if (mode === 'fastest') return dist;
 
   const midLat = (na.lat + nb.lat) / 2;
   const midLon = (na.lon + nb.lon) / 2;
-  const bonus = hotspotBonus(midLat, midLon, hotspots);
+  
+  const p1 = getHotspotPenalty(na.lat, na.lon, hotspots);
+  const p2 = getHotspotPenalty(nb.lat, nb.lon, hotspots);
+  const p3 = getHotspotPenalty(midLat, midLon, hotspots);
 
-  if (mode === 'connected') return dist * bonus;
-  return dist * (0.5 + 0.5 * bonus);
+  const segmentPenalty = Math.min(p1, p2, p3);
+
+  if (mode === 'connected') {
+    return dist * segmentPenalty;
+  }
+  
+  return dist * ((1.0 + segmentPenalty) / 2);
 }
 
 function nearestNode(nodes: Nodes, lat: number, lon: number): number {
@@ -148,15 +159,16 @@ async function fetchRoadGraph(
   lat1: number, lon1: number,
   lat2: number, lon2: number
 ): Promise<{ graph: Graph; nodes: Nodes }> {
-  const minLat = Math.min(lat1, lat2) - 0.02;
-  const maxLat = Math.max(lat1, lat2) + 0.02;
-  const minLon = Math.min(lon1, lon2) - 0.02;
-  const maxLon = Math.max(lon1, lon2) + 0.02;
+  const minLat = Math.min(lat1, lat2) - 0.04;
+  const maxLat = Math.max(lat1, lat2) + 0.04;
+  const minLon = Math.min(lon1, lon2) - 0.04;
+  const maxLon = Math.max(lon1, lon2) + 0.04;
 
+  // Added service and living_street to the query
   const query = `
     [out:json][timeout:30];
     (
-      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"]
+      way["highway"~"^(motorway|trunk|primary|secondary|tertiary|unclassified|residential|service|living_street|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link)$"]
         (${minLat},${minLon},${maxLat},${maxLon});
     );
     out body;
@@ -182,7 +194,9 @@ async function fetchRoadGraph(
   for (const el of data.elements) {
     if (el.type === 'way' && el.nodes?.length >= 2) {
       const nodeIds: number[] = el.nodes;
-      const oneWay = el.tags?.oneway === 'yes' || el.tags?.highway === 'motorway';
+      
+      // Temporarily forced to false to ignore one-way restrictions
+      const oneWay = false; 
 
       for (let i = 0; i < nodeIds.length - 1; i++) {
         const a = nodeIds[i];
