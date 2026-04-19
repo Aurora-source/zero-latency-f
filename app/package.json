@@ -1,10 +1,13 @@
 {
   "name": "@figma/my-make-file",
+  "main": "expo/AppEntry.js",
   "private": true,
   "version": "0.0.1",
   "type": "module",
   "scripts": {
+    "start": "expo start",
     "dev": "vite",
+    "android": "expo run:android",
     "build": "vite build",
     "preview": "vite preview"
   },
@@ -40,13 +43,13 @@
     "@radix-ui/react-toggle": "1.1.2",
     "@radix-ui/react-toggle-group": "1.1.2",
     "@radix-ui/react-tooltip": "1.1.8",
-    "axios": "^1.15.0",
     "canvas-confetti": "1.9.4",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "cmdk": "1.1.1",
     "date-fns": "3.6.0",
     "embla-carousel-react": "8.6.0",
+    "expo": "^55.0.15",
     "input-otp": "1.4.2",
     "lucide-react": "0.487.0",
     "motion": "12.23.24",
@@ -73,8 +76,13 @@
     "vite": "6.3.5"
   },
   "peerDependencies": {
+    "@types/react": "18.3.1",
+    "@types/react-dom": "18.3.1",
+    "path": "^0.12.7",
     "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react-dom": "18.3.1",
+    "react-router-dom": "7.13.0",
+    "typescript": "5.7.2"
   },
   "peerDependenciesMeta": {
     "react": {
