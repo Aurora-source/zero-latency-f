@@ -1,0 +1,2 @@
+cuspatial-cu12
+cupy-cuda12x

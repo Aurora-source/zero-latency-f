@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Node / React
+node_modules/
+.next/
+.cache/
+*.tsbuildinfo
+
+# Android / React Native
+android/.gradle/
+android/app/build/
+android/.cxx/
+*.apk
+*.aab
+*.keystore
+!debug.keystore
+
+# General
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+.idea/
+.vscode/
+
+# Docker / infra
+*.env.local
+docker-compose.override.yml
+
+# Runtime cache
+cache/
+
+# Project-specific redundant files
+
+# Duplicate / stale startup scripts
+nah.ps1
+
+# Binary archives
+app.rar
+services/visualization.zip
+
+# Stale logs
+services/visualization1/vite-start-test.log
+cache/frontend-dev.log
+
+# Generated runtime cache (recreated automatically)
+cache/
+services/routing-engine/cache/
+
+# Python bytecode
+tests/__pycache__/
+services/data-service/__pycache__/
+services/prediction-service/__pycache__/
+services/routing-engine/__pycache__/
+services/telemetry-service/__pycache__/
+services/data-service/tools/__pycache__/
+
+# Generated frontend build output
+services/visualization/dist/
+app/app/dist/
+
+# Installed dependency trees (reproducible from lockfiles)
+services/visualization/node_modules/
+services/visualization1/node_modules/
+app/app/node_modules/
+# Large data files
+*.graphml
+*.pkl
+*.csv
+*.csv.gz
+*.osm.pbf

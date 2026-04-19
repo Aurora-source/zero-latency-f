@@ -1,0 +1,124 @@
+@import './fonts.css';
+@import './tailwind.css';
+@import './theme.css';
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+.leaflet-tile {
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.leaflet-tile-loaded {
+  opacity: 1;
+}
+
+.route-card-transition {
+  transition: all 0.3s ease-in-out;
+  will-change: transform, opacity;
+}
+
+.route-card-shimmer {
+  position: relative;
+}
+
+.route-card-shimmer::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0) 0%,
+    rgba(255, 255, 255, 0.08) 45%,
+    rgba(255, 255, 255, 0.16) 50%,
+    rgba(255, 255, 255, 0.08) 55%,
+    rgba(255, 255, 255, 0) 100%
+  );
+  animation: route-card-shimmer 1.6s linear infinite;
+}
+
+@keyframes route-card-shimmer {
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.signal-bars {
+  display: inline-flex;
+  align-items: end;
+  gap: 2px;
+}
+
+.signal-bars span {
+  width: 3px;
+  border-radius: 999px;
+  background: rgba(125, 211, 252, 0.9);
+  animation: signal-bars 0.9s ease-in-out infinite;
+}
+
+.signal-bars span:nth-child(1) {
+  height: 8px;
+  animation-delay: 0ms;
+}
+
+.signal-bars span:nth-child(2) {
+  height: 12px;
+  animation-delay: 120ms;
+}
+
+.signal-bars span:nth-child(3) {
+  height: 16px;
+  animation-delay: 240ms;
+}
+
+.signal-bars-inline {
+  min-width: 15px;
+}
+
+@keyframes signal-bars {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scaleY(0.75);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scaleY(1);
+  }
+}
+
+.route-line {
+  filter: drop-shadow(0 0 3px rgba(59, 130, 246, 0.5));
+  stroke-dasharray: var(--route-length, 1600);
+  stroke-dashoffset: var(--route-length, 1600);
+  animation: route-line-draw 0.8s ease-out forwards;
+  animation-delay: var(--route-delay, 0ms);
+  will-change: stroke-dashoffset, opacity;
+}
+
+.route-line-idle {
+  opacity: 0.82;
+}
+
+.route-line-selected,
+.route-line-signal {
+  opacity: 0.96;
+}
+
+@keyframes route-line-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;

@@ -1,0 +1,548 @@
+{
+  "city": "bangalore",
+  "fetched_at": "2026-04-18",
+  "source": "TRAI",
+  "responses": [],
+  "attempts": [
+    {
+      "endpoint": "trai_primary",
+      "operator": "all",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "all",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "all",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "all",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Jio",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Jio",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Jio",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Jio",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Airtel",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Airtel",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Airtel",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Airtel",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Vi",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Vi",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Vi",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "Vi",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "BSNL",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "BSNL",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "BSNL",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_primary",
+      "operator": "BSNL",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "all",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=4G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "all",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=3G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "all",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=2G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "all",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=all&technology=5G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Jio",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=4G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Jio",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=3G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Jio",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=2G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Jio",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=5G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Airtel",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=4G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Airtel",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=3G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Airtel",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=2G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Airtel",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=5G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Vi",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=4G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Vi",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=3G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Vi",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=2G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "Vi",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=5G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "BSNL",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=4G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "BSNL",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=3G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "BSNL",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=2G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "myspeed_primary",
+      "operator": "BSNL",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=utf-8",
+      "url": "https://myspeed.trai.gov.in/api/coverage?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=5G",
+      "preview": "<!DOCTYPE html><html lang=\"en\" class=\"dark\"><head><meta charSet=\"utf-8\"/><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, maximum-scale=1\"/><link rel=\"stylesheet\" href=\"/_next/stati"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "all",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=all&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "all",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=all&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "all",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=all&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "all",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=all&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Jio",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Jio",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Jio",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Jio",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Jio&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Airtel",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Airtel",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Airtel",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Airtel",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Airtel&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Vi",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Vi",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Vi",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "Vi",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=Vi&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "BSNL",
+      "technology": "4G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=4G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "BSNL",
+      "technology": "3G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=3G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "BSNL",
+      "technology": "2G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=2G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    },
+    {
+      "endpoint": "trai_alt_path",
+      "operator": "BSNL",
+      "technology": "5G",
+      "status_code": 404,
+      "content_type": "text/html; charset=UTF-8",
+      "url": "https://trai.gov.in/api/coverage-map?state=Karnataka&district=Bangalore+Urban&operator=BSNL&technology=5G",
+      "preview": "<!DOCTYPE html> <html lang=\"en\" dir=\"ltr\" style=\"--color--primary-hue:202;--color--primary-saturation:79%;--color--primary-lightness:50\">   <head>     <meta charset=\"utf-8\" /> <link rel=\"canonical\" hr"
+    }
+  ]
+}

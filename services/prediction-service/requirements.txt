@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+xgboost>=2.1
+lightgbm>=4.3
+scikit-learn
+numpy
+pandas
+joblib

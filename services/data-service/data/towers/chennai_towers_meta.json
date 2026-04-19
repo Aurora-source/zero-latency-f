@@ -1,0 +1,7 @@
+{
+  "city": "chennai",
+  "source": "OpenCelliD",
+  "tower_count": 0,
+  "last_updated": "2026-04-18",
+  "downloaded_from": "https://opencellid.org/ocid/downloads?file=cell_towers.csv.gz&token=world&type=full"
+}

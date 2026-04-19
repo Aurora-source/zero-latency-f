@@ -1,0 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch
+xgboost>=2.1
+lightgbm>=4.3
+cupy-cuda12x
