@@ -3,7 +3,6 @@ from __future__ import annotations
 import csv
 import json
 import math
-import os
 import pickle
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,11 +28,6 @@ TRAI_DIR = DATA_DIR / "trai"
 TOWERS_DIR = DATA_DIR / "towers"
 SCORES_DIR = DATA_DIR / "scores"
 GRAPHS_DIR = DATA_DIR / "graphs"
-OPENCELLID_TOKEN = os.environ.get(
-    "OPENCELLID_TOKEN",
-    "pk.37dddd741049308fd26c175be7a5aea0",
-)
-
 ROAD_FALLBACK_SCORE = 0.05
 TRAI_TECHNOLOGY_WEIGHTS = {
     "5g": 1.0,
@@ -237,11 +231,23 @@ def score_segments_from_trai(city: str, segments: list[SegmentPoint]) -> tuple[d
             covered += 1
         scores[segment.segment_id] = round(float(min(best_score, 1.0)), 3)
 
+    real_data_coverage = round((covered / max(len(segments), 1)) * 100.0, 1)
+    good_signal_percent = round(
+        (sum(1 for value in scores.values() if value >= 0.6) / max(len(scores), 1)) * 100.0,
+        1,
+    )
     metadata = {
         "city": city,
-        "source": "TRAI",
+        "source": (
+            "trai"
+            if real_data_coverage >= 100.0
+            else "hybrid" if real_data_coverage > 0.0 else "ml_synthetic"
+        ),
+        "real_data_source": "trai",
         "tower_count": 0,
-        "coverage_percent": round((covered / max(len(segments), 1)) * 100.0, 1),
+        "real_data_coverage_percent": real_data_coverage,
+        "good_signal_percent": good_signal_percent,
+        "coverage_percent": real_data_coverage,
         "dead_zone_percent": round(
             (sum(1 for value in scores.values() if value < 0.3) / max(len(scores), 1)) * 100.0,
             1,
@@ -385,11 +391,23 @@ def score_segments_from_towers(city: str, segments: list[SegmentPoint]) -> tuple
         segment.segment_id: round(float(score), 3)
         for segment, score in zip(segments, scores_array, strict=False)
     }
+    real_data_coverage = round(
+        float(np.mean(scores_array > (ROAD_FALLBACK_SCORE + 1e-6)) * 100.0),
+        1,
+    )
+    good_signal_percent = round(float(np.mean(scores_array >= 0.6) * 100.0), 1)
     metadata = {
         "city": city,
-        "source": "OpenCelliD",
+        "source": (
+            "opencellid"
+            if real_data_coverage >= 100.0
+            else "hybrid" if real_data_coverage > 0.0 else "ml_synthetic"
+        ),
+        "real_data_source": "opencellid",
         "tower_count": tower_data.count,
-        "coverage_percent": round(float(np.mean(scores_array >= 0.6) * 100.0), 1),
+        "real_data_coverage_percent": real_data_coverage,
+        "good_signal_percent": good_signal_percent,
+        "coverage_percent": real_data_coverage,
         "dead_zone_percent": round(float(np.mean(scores_array < 0.3) * 100.0), 1),
         "last_updated": tower_data.last_updated,
     }
@@ -424,7 +442,8 @@ def main() -> int:
         print(
             f"[coverage] {city}: source={metadata['source']} "
             f"scores={len(scores)} dead={metadata['dead_zone_percent']}% "
-            f"good={metadata['coverage_percent']}%"
+            f"good={metadata['good_signal_percent']}% "
+            f"real={metadata['real_data_coverage_percent']}%"
         )
 
     return 0

@@ -120,9 +120,14 @@ function Ensure-FrontendDependencies {
     Write-Info "Installing frontend dependencies"
     Push-Location $FrontendPath
     try {
-        & $NpmExe install --silent
+        if (Test-Path -LiteralPath $packageLock) {
+            & $NpmExe ci --silent
+        }
+        else {
+            & $NpmExe install --silent
+        }
         if ($LASTEXITCODE -ne 0) {
-            Fail-Script "npm install failed in $FrontendPath"
+            Fail-Script "npm dependency installation failed in $FrontendPath"
         }
     }
     finally {
@@ -380,35 +385,13 @@ function Clear-ProjectCache {
 
 Write-Section "Preparing run-local.ps1"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-Set-Location $root
-$root = (Resolve-Path $root).Path
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = (Resolve-Path $scriptDir).Path
 Write-Info "Project root: $root"
-
-function Load-EnvFile {
-    param ([string]$Path)
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        return
-    }
-
-    Get-Content -LiteralPath $Path | ForEach-Object {
-        if ($_ -match "^\s*([^#].+?)\s*=\s*(.+)$") {
-            $name = $matches[1].Trim()
-            $value = $matches[2].Trim().Trim("'").Trim('"')
-            Set-Item -Path "Env:$name" -Value $value
-        }
-    }
-}
 
 $envFile = Join-Path $root "services\data-service\.env"
 if (Test-Path -LiteralPath $envFile) {
-    Write-Info "[verify] .env found"
-    Load-EnvFile "$root/services/data-service/.env"
-    Write-Host "[startup] Loaded .env variables" -ForegroundColor Cyan
-    if (-not [string]::IsNullOrWhiteSpace($env:OPENCELLID_KEYS)) {
-        Write-Info "[verify] OPENCELLID_KEYS detected"
-    }
+    Write-Info "[verify] data-service environment file found; only data-service will read it"
 }
 
 $venvPython = Join-Path $root ".venv\Scripts\python.exe"
@@ -478,7 +461,6 @@ $env:HOTSPOT_CACHE_PATH = $hotspotCachePath
 $env:ROUTE_CACHE_PATH = $routeCachePath
 $env:ROUTING_MODES = "fastest,balanced,connected"
 $env:HEATMAP_VIEWPORT_ONLY = "1"
-$env:OPENCELLID_TOKEN = if ($env:OPENCELLID_TOKEN) { $env:OPENCELLID_TOKEN } else { "pk.37dddd741049308fd26c175be7a5aea0" }
 Write-Ok "Bangalore-only and cache environment configured"
 
 if ($WhatIf) {
@@ -575,11 +557,14 @@ $commonEnv = @(
     "ROUTE_CACHE_PATH='$routeCachePath'",
     "ROUTING_MODES='fastest,balanced,connected'",
     "HEATMAP_VIEWPORT_ONLY='1'",
-    "OPENCELLID_TOKEN='pk.37dddd741049308fd26c175be7a5aea0'"
+)
+$nonDataSecretOverrides = @(
+    "OPENCELLID_KEYS=''",
+    "OPENCELLID_TOKEN=''"
 )
 
 $predictionPath = Join-Path $root "services\prediction-service"
-Start-ServiceWindow -Name "prediction-service" -ServicePath $predictionPath -Port 8003 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + @("MAX_RAM_MB='1024'")) | Out-Null
+Start-ServiceWindow -Name "prediction-service" -ServicePath $predictionPath -Port 8003 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + $nonDataSecretOverrides + @("MAX_RAM_MB='1024'")) | Out-Null
 Wait-ForHttpJson -Name "prediction-service" -Url "http://127.0.0.1:8003/health" -Validator { param($json) $json.status -eq "ok" }
 
 $dataPath = Join-Path $root "services\data-service"
@@ -591,7 +576,7 @@ Wait-ForHttpJson -Name "data-service" -Url "http://127.0.0.1:8001/health" -Valid
 
 $routingPath = Join-Path $root "services\routing-engine"
 $routingWorkers = if ($env:OS -eq "Windows_NT") { 1 } else { 4 }
-Start-ServiceWindow -Name "routing-engine" -ServicePath $routingPath -Port 8002 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + @("DATA_SERVICE_URL='http://127.0.0.1:8001'", "MAX_RAM_MB='2048'")) -DisableReload -Workers $routingWorkers | Out-Null
+Start-ServiceWindow -Name "routing-engine" -ServicePath $routingPath -Port 8002 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + $nonDataSecretOverrides + @("DATA_SERVICE_URL='http://127.0.0.1:8001'", "MAX_RAM_MB='2048'")) -DisableReload -Workers $routingWorkers | Out-Null
 Wait-ForHttpJson -Name "routing-engine" -Url "http://127.0.0.1:8002/health" -Validator {
     param($json)
     $json.status -eq "ok" -and $json.graph_ready -eq $true
@@ -599,7 +584,7 @@ Wait-ForHttpJson -Name "routing-engine" -Url "http://127.0.0.1:8002/health" -Val
 
 $telemetryPath = Join-Path $root "services\telemetry-service"
 if (Test-Path -LiteralPath $telemetryPath) {
-    Start-ServiceWindow -Name "telemetry-service" -ServicePath $telemetryPath -Port 8004 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + @("MAX_RAM_MB='256'")) | Out-Null
+    Start-ServiceWindow -Name "telemetry-service" -ServicePath $telemetryPath -Port 8004 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + $nonDataSecretOverrides + @("MAX_RAM_MB='256'")) | Out-Null
 }
 else {
     Write-WarnLine "telemetry-service directory not found; skipping"
@@ -621,8 +606,10 @@ else {
     Write-Host "[frontend] Starting dev server on port $frontendPort..." -ForegroundColor Cyan
     $frontendCommand = @"
 Set-Location '$vizPath'
+`$env:OPENCELLID_KEYS = ''
+`$env:OPENCELLID_TOKEN = ''
 Write-Host '[frontend] Starting dev server on port $frontendPort...' -ForegroundColor Cyan
-& '$npmExe' run dev -- --host 0.0.0.0 --port $frontendPort --configLoader native 2>&1 | Tee-Object -FilePath '$frontendLogPath'
+& '$npmExe' run dev -- --host 0.0.0.0 --port $frontendPort 2>&1 | Tee-Object -FilePath '$frontendLogPath'
 exit `$LASTEXITCODE
 "@
     $frontendProcess = Start-Process powershell.exe -ArgumentList @(

@@ -1,0 +1,4 @@
+-r services/data-service/requirements.txt
+-r services/routing-engine/requirements.txt
+
+pytest==8.3.4

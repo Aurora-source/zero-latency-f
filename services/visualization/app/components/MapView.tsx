@@ -1,5 +1,6 @@
-import { Component, memo, useEffect, useRef, useState, type ErrorInfo, type ReactNode } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import L from "leaflet";
+import type {} from "leaflet.vectorgrid";
 import "leaflet.vectorgrid/dist/Leaflet.VectorGrid.bundled.js";
 import {
   CircleMarker,
@@ -30,23 +31,6 @@ const ROUTE_STYLES: Record<string, { color: string }> = {
   balanced: { color: "#8b5cf6" },
   connected: { color: "#10b981" },
 };
-
-function lightenColor(color: string, amount: number) {
-  const normalized = color.replace("#", "");
-  if (normalized.length !== 6) {
-    return color;
-  }
-
-  const clamp = (value: number) => Math.max(0, Math.min(255, Math.round(value)));
-  const mix = (channel: string) => {
-    const base = Number.parseInt(channel, 16);
-    return clamp(base + (255 - base) * amount)
-      .toString(16)
-      .padStart(2, "0");
-  };
-
-  return `#${mix(normalized.slice(0, 2))}${mix(normalized.slice(2, 4))}${mix(normalized.slice(4, 6))}`;
-}
 
 function MapUpdater({ viewRequest }: { viewRequest?: MapViewRequest | null }) {
   const map = useMap();
@@ -150,46 +134,6 @@ function MapViewportLogger({
   return null;
 }
 
-class HeatmapLayerBoundary extends Component<
-  {
-    children: ReactNode;
-    onError?: (error: Error, errorInfo: ErrorInfo) => void;
-    resetKey: string;
-  },
-  { hasError: boolean }
-> {
-  constructor(props: {
-    children: ReactNode;
-    onError?: (error: Error, errorInfo: ErrorInfo) => void;
-    resetKey: string;
-  }) {
-    super(props);
-    this.state = { hasError: false };
-  }
-
-  static getDerivedStateFromError() {
-    return { hasError: true };
-  }
-
-  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
-    console.error("[heatmap] overlay crashed", error, errorInfo);
-    this.props.onError?.(error, errorInfo);
-  }
-
-  componentDidUpdate(prevProps: Readonly<{ resetKey: string }>) {
-    if (prevProps.resetKey !== this.props.resetKey && this.state.hasError) {
-      this.setState({ hasError: false });
-    }
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return null;
-    }
-    return this.props.children;
-  }
-}
-
 function VectorTileOverlay({
   city,
   enabled,
@@ -208,71 +152,50 @@ function VectorTileOverlay({
       return undefined;
     }
 
-    onLoadingChange?.(true);
-    const stopLoading = () => onLoadingChange?.(false);
-    let fallbackId: number | null = null;
-    let vectorLayer: L.Layer | null = null;
+    const vectorLayer = L.vectorGrid.protobuf(
+      `/api/tiles/${city}/{z}/{x}/{y}.mvt`,
+      {
+        rendererFactory: L.canvas.tile,
+        interactive: false,
+        minZoom: 10,
+        maxZoom: 16,
+        maxNativeZoom: 16,
+        vectorTileLayerStyles: {
+          roads: (properties: { connectivity_score?: number; road_type?: string }, zoom: number) => {
+            const score = Number(properties?.connectivity_score ?? 0.5);
 
-    try {
-      vectorLayer = (L as any).vectorGrid.protobuf(
-        `/api/tiles/${city}/{z}/{x}/{y}.mvt`,
-        {
-          rendererFactory: L.canvas.tile,
-          interactive: false,
-          minZoom: 10,
-          maxZoom: 16,
-          maxNativeZoom: 16,
-          vectorTileLayerStyles: {
-            roads: (properties: any, zoom: number) => {
-              const score = Number(properties?.connectivity_score ?? 0.5);
-
-              return {
-                color: connectivityColor(score),
-                weight: roadWeight(properties?.road_type ?? "unknown", zoom),
-                opacity: 0.7,
-                fill: false,
-                stroke: true,
-                lineCap: "round",
-                lineJoin: "round",
-              };
-            },
+            return {
+              color: connectivityColor(score),
+              weight: roadWeight(properties?.road_type ?? "unknown", zoom),
+              opacity: 0.7,
+              fill: false,
+              stroke: true,
+              lineCap: "round",
+              lineJoin: "round",
+            };
           },
         },
-      );
+      },
+    );
 
-      fallbackId = window.setTimeout(stopLoading, 1200);
-      const handleTileError = (event?: unknown) => {
-        console.error("[heatmap] tile load failed", event);
-        stopLoading();
-      };
-      vectorLayer.on?.("load", stopLoading);
-      vectorLayer.on?.("tileerror", handleTileError);
-      vectorLayer.addTo(map);
-      layerRef.current = vectorLayer;
+    onLoadingChange?.(true);
+    const stopLoading = () => onLoadingChange?.(false);
+    const fallbackId = window.setTimeout(stopLoading, 1200);
+    vectorLayer.on?.("load", stopLoading);
+    vectorLayer.on?.("tileerror", stopLoading);
+    vectorLayer.addTo(map);
+    layerRef.current = vectorLayer;
 
-      return () => {
-        if (fallbackId !== null) {
-          window.clearTimeout(fallbackId);
-        }
-        vectorLayer?.off?.("load", stopLoading);
-        vectorLayer?.off?.("tileerror", handleTileError);
-        if (!layerRef.current) {
-          onLoadingChange?.(false);
-          return;
-        }
+    return () => {
+      window.clearTimeout(fallbackId);
+      vectorLayer.off?.("load", stopLoading);
+      vectorLayer.off?.("tileerror", stopLoading);
+      if (!layerRef.current) return;
 
-        map.removeLayer(layerRef.current);
-        layerRef.current = null;
-        onLoadingChange?.(false);
-      };
-    } catch (error) {
-      console.error("[heatmap] failed to initialize overlay", error);
-      if (fallbackId !== null) {
-        window.clearTimeout(fallbackId);
-      }
+      map.removeLayer(layerRef.current);
+      layerRef.current = null;
       onLoadingChange?.(false);
-      return undefined;
-    }
+    };
   }, [city, enabled, map, onLoadingChange]);
 
   return null;
@@ -325,16 +248,14 @@ function RoutePolyline({
     <Polyline
       ref={routeRef}
       positions={coordinates}
+      noClip
+      smoothFactor={0}
       pathOptions={{
-        color: selected
-          ? ROUTE_STYLES[mode]?.color ?? "#8b5cf6"
-          : lightenColor(ROUTE_STYLES[mode]?.color ?? "#8b5cf6", 0.45),
-        weight: selected ? 6 : 3,
-        opacity: selected ? 1 : 0.3,
+        color: ROUTE_STYLES[mode]?.color ?? "#8b5cf6",
+        weight: selected ? 8 : 5,
+        opacity: selected ? 0.95 : 0.72,
         lineCap: "round",
         lineJoin: "round",
-        noClip: true,
-        smoothFactor: 0,
         className: `route-line ${selected ? "route-line-selected" : "route-line-idle"}`,
       }}
     />
@@ -370,14 +291,14 @@ function RouteSignalSegment({
       ref={segmentRef}
       key={`${routeId}-${segmentId ?? delayMs}`}
       positions={coordinates}
+      noClip
+      smoothFactor={0}
       pathOptions={{
         color: connectivityColor(score),
         weight: 7,
         opacity: 0.96,
         lineCap: "round",
         lineJoin: "round",
-        noClip: true,
-        smoothFactor: 0,
         className: "route-line route-line-signal",
       }}
     />
@@ -477,16 +398,11 @@ function MapViewComponent({
         />
 
         {city ? (
-          <HeatmapLayerBoundary
-            resetKey={`${city}:${showHeatmap ? "on" : "off"}`}
-            onError={() => setHeatmapLoading(false)}
-          >
-            <VectorTileOverlay
-              city={city}
-              enabled={showHeatmap}
-              onLoadingChange={setHeatmapLoading}
-            />
-          </HeatmapLayerBoundary>
+          <VectorTileOverlay
+            city={city}
+            enabled={showHeatmap}
+            onLoadingChange={setHeatmapLoading}
+          />
         ) : null}
 
         {routes.map((route) => (
@@ -522,7 +438,7 @@ function MapViewComponent({
           hotspots.map((hotspot) => (
             <CircleMarker
               key={hotspot.id}
-              position={[hotspot.lat, hotspot.lon]}
+              center={[hotspot.lat, hotspot.lon]}
               radius={hotspot.signal_strength === "weak" ? 10 : 7}
               pathOptions={{
                 color:

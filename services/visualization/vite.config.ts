@@ -8,6 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export default defineConfig({
+  // Browser configuration is public; credentials belong only in the data service.
+  envDir: false,
   plugins: [
     react(),
     tailwindcss(),
@@ -55,17 +57,17 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace("/api", ""),
       },
+      "/api/cache-status": {
+        target: "http://localhost:8001",
+        changeOrigin: true,
+        rewrite: (path) => path.replace("/api", ""),
+      },
       "/api/tiles": {
         target: "http://localhost:8001",
         changeOrigin: true,
         rewrite: (path) => path.replace("/api", ""),
       },
       "/api/scores": {
-        target: "http://localhost:8001",
-        changeOrigin: true,
-        rewrite: (path) => path.replace("/api", ""),
-      },
-      "/api/cache-status": {
         target: "http://localhost:8001",
         changeOrigin: true,
         rewrite: (path) => path.replace("/api", ""),

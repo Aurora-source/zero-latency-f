@@ -1,227 +1,137 @@
-# Connectivity Aware Routing
+# Connectivity-Aware Routing
 
-Real-time connectivity-aware route planning with live signal heatmaps, multi-mode routing, and dashboard UIs for local visualization and infotainment-style display.
+This project contains the routing engine, prediction service, data service, gateway, and visualization frontend for connectivity-aware route planning. Bangalore is the currently supported production region.
 
----
+The stable service/frontend contract, loading semantics, provenance vocabulary, and compatibility aliases are documented in [`docs/api-contract.md`](docs/api-contract.md).
 
-## Tech Stack
+## Architecture and authoritative frontend
 
-### Backend Services
-- Python 3.11
-- FastAPI
-- NetworkX + OSMnx
-- NumPy / optional CuPy GPU acceleration
-- SQLite tile and tower cache
-
-### Primary Frontend (`services/visualization`)
-- React + Vite
-- TypeScript
-- Leaflet / React-Leaflet
-
-### Dashboard UI (`app/app`)
-- React + Vite
-- TypeScript
-- MUI + Radix UI
-- Axios for backend API integration
-
----
-
-## Project Structure
+- `services/data-service` owns road tiles, city scores, local/live tower ingestion,
+  and the persistent tower cache (port 8001).
+- `services/routing-engine` owns fastest, balanced, and connected pathfinding
+  (port 8002).
+- `services/prediction-service` supplies the CPU-compatible ML fallback (port 8003).
+- `services/telemetry-service` is an optional local service (port 8004); it is not
+  currently part of the production Compose topology.
+- `services/visualization` is the authoritative React/Vite frontend (port 3000 in
+  Compose, normally 5173 in local development).
+- `services/visualization1` and `services/visualization/visualization` are historical
+  reference copies. `app/app` is a separate dashboard UI. None of these three is the
+  production frontend.
+- `gateway/nginx.conf` is the public entry point and proxies browser `/api` requests.
 
 ```text
-connectivity-aware-routing/
-├── services/
-│   ├── data-service/         # Tower cache, tile API, hotspot/coverage data
-│   ├── routing-engine/       # Route scoring and pathfinding API
-│   ├── prediction-service/   # Signal prediction API
-│   ├── telemetry-service/    # Lightweight telemetry API
-│   ├── visualization/        # Main React/Vite map frontend
-│   └── visualization1/       # Legacy/reference frontend snapshot
-├── app/
-│   └── app/                  # Alternate dashboard UI
-├── gateway/                  # Nginx gateway config
-├── cache/                    # Local runtime cache
-├── docker-compose.yml        # Full stack Docker orchestration
-├── run-local.ps1             # Local Windows startup script
-└── README.md
+Browser -> Nginx -> services/visualization
+                 -> routing-engine -> data-service -> prediction-service
+                                   -> tower/graph caches
 ```
 
----
+Docker Compose is the authoritative production runtime. `run-local.ps1` is the
+developer-oriented Windows/WSL startup path.
 
-## Running Locally — PowerShell
+## Local run
 
-### Prerequisites
-- Windows 10/11
-- PowerShell 5.1+
-- Python 3.10+ on `PATH`
-- Node.js 18+ and npm
+Prerequisites are Python 3.11, Node.js 20.19+ or 22.12+, npm, and PowerShell 5.1 or newer.
 
-### Setup
+Use `run-local.ps1` from the repo root to create or activate the root virtual environment, start the Python services with `uvicorn`, and launch the Vite frontend without Docker.
 
 ```powershell
-git clone <repo-url>
-cd connectivity-aware-routing
 Copy-Item services\data-service\.env.example services\data-service\.env
-```
-
-Edit `services/data-service/.env` and set required values.
-
-### Start the stack
-
-```powershell
 .\run-local.ps1
 ```
 
-This script:
-- resolves paths dynamically from the script location
-- loads `services/data-service/.env`
-- installs missing backend/frontend dependencies when needed
-- starts backend services and the main visualization frontend
+The service-local environment file is optional when no OpenCellID credential is
+needed. The script may install missing dependencies, so review that action before
+using it in a constrained or offline environment.
 
-### Local service URLs
+| Local service | URL |
+| --- | --- |
+| Data API | `http://localhost:8001` |
+| Routing API | `http://localhost:8002` |
+| Prediction API | `http://localhost:8003` |
+| Telemetry API (when present) | `http://localhost:8004` |
+| Authoritative frontend | `http://localhost:5173` |
 
-| Service | URL |
-|---|---|
-| Data Service | http://localhost:8001 |
-| Routing Engine | http://localhost:8002 |
-| Prediction Service | http://localhost:8003 |
-| Telemetry Service | http://localhost:8004 |
-| Main Frontend | http://localhost:5173 |
+## Compose run
 
----
-
-## Running with Docker
+Blank credentials are a supported configuration:
 
 ```bash
-git clone <repo-url>
-cd connectivity-aware-routing
-cp services/data-service/.env.example services/data-service/.env
-docker compose up --build
+docker compose --env-file /dev/null config --no-interpolate
+docker compose --env-file /dev/null up --build
 ```
 
-Run in background:
+To provide credentials without sharing them with other services, pass an external
+environment file to Compose. The Compose file injects the two OpenCellID variables
+only into `data-service`; never commit that environment file.
 
 ```bash
-docker compose up --build -d
+docker compose --env-file services/data-service/.env up --build
 ```
 
-Check status:
+The gateway is available at `http://localhost/`. Compose health gates use each
+backend's `/ready` endpoint, while `/health` remains a liveness/diagnostic endpoint.
 
-```bash
-docker compose ps
-```
+## Routing modes
 
-Stop:
+- `fastest` minimizes dimensionally correct travel time.
+- `balanced` trades some travel time for connectivity and risk quality.
+- `connected` strongly avoids weak/dead-signal edges when a viable alternative
+  exists.
 
-```bash
-docker compose down
-```
+Vehicle profiles keep `scooter`, `bike`, `car`, and `truck` as separate API values.
 
-Remove volumes too:
+## Data-service credentials and local tower data
 
-```bash
-docker compose down -v
-```
+OpenCellID credentials are optional. `OPENCELLID_KEYS` accepts a comma-separated rotation list and `OPENCELLID_TOKEN` is the single-key compatibility input. Both default to an empty value; the data service remains usable with prediction fallback when neither is configured. Never commit credential values.
 
----
+Compose passes these variables only to `data-service`. Prediction, routing, telemetry, visualization, and gateway processes do not receive them. `run-local.ps1` likewise leaves service-local environment-file loading to the data service and explicitly clears inherited OpenCellID variables in non-data child processes.
 
-## Dashboard App (`app/app`)
+An optional local Bangalore tower CSV can be supplied at the path named by `LOCAL_TOWER_CSV_PATH`. Compose expects it under the shared cache at `/app/shared-cache/towers/bangalore_towers.csv`; it is runtime data and must not be committed or included in an image. Set `LOCAL_TOWER_PROVENANCE` to `opencellid` or `trai` when the provider is known; its safe default is `unknown`.
 
-`app/app` is a separate React + Vite dashboard UI. It is useful for infotainment-style or kiosk/dashboard rendering and is already wired for direct HTTPS API use.
+Precomputed score metadata belongs under the shared cache path configured by
+`REAL_SCORE_DIR`. The compatibility field `coverage_percent` means real-data
+coverage; signal quality is reported separately as `good_signal_percent`.
 
-Run it separately:
+## CPU and optional GPU acceleration
 
-```powershell
-cd app\app
-npm install
-npm run dev
-```
+The default Compose topology uses Python 3.11 CPU images, does not reserve an NVIDIA
+device, and runs on CPU-only hosts. GPU detection in the services remains
+opportunistic. Set the Docker build argument `INSTALL_GPU_REQUIREMENTS=1` for the
+prediction and routing images and expose an NVIDIA device through a host-specific
+Compose override; the shared topology intentionally does not require one.
 
-Build it:
+For local NVIDIA acceleration (RTX 5070 / CUDA 12.8+):
 
-```powershell
-cd app\app
-npm run build
-```
+1. Install CUDA 12.8 toolkit:
+   https://developer.nvidia.com/cuda-downloads
+   Select: Windows > x86_64 > 11 > exe(local)
 
----
+2. Verify CUDA install:
+   `nvcc --version`  # should show 12.8 or higher
+   `nvidia-smi`      # should show RTX 5070
 
-## Routing Modes
+3. Install GPU Python packages:
+   `pip install torch --index-url https://download.pytorch.org/whl/cu128`
+   `pip install xgboost>=2.1 lightgbm>=4.3`
 
-The route planner operates on a road-network graph where intersections are nodes and road segments are edges. The system exposes three practical route modes:
+4. Optional - GPU acceleration extras:
+   `pip install cupy-cuda12x`
+   `pip install cuspatial-cu12`  # tile indexing only; Linux support varies
 
-### Fastest
-- prioritizes travel time
-- minimizes delay and congestion cost
-- best when ETA matters more than signal continuity
+5. Verify GPU is detected by the app:
+   `python -c "import torch; print(torch.cuda.get_device_name(0))"`
+   Expected: `NVIDIA GeForce RTX 5070`
 
-### Balanced
-- balances travel time and connectivity
-- aims for a practical compromise between speed and signal quality
+All GPU features degrade gracefully to CPU if CUDA is unavailable.
 
-### Connected
-- strongly prefers signal-rich corridors
-- will accept longer travel time to avoid weak or dead-signal segments where possible
+## Common issues
 
----
-
-## Environment Variables
-
-| Variable | Description | Example |
-|---|---|---|
-| DATA_SERVICE_URL | URL used by routing clients | http://localhost:8001 |
-| ROUTING_ENGINE_URL | Routing API URL | http://localhost:8002 |
-| DEFAULT_CITY | Default city to load | bangalore |
-| OPENCELLID_KEYS | Comma-separated OpenCellID keys | key1,key2,key3 |
-
----
-
-## Common Issues
-
-### PowerShell execution policy error
-
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-```
-
-### Port already in use
-
-```powershell
-netstat -ano | findstr :8001
-```
-
-Kill the conflicting process or free the port before rerunning `run-local.ps1`.
-
-### Heatmap not loading over a custom domain
-- use relative tile URLs such as `/api/tiles/...`
-- avoid hardcoded `localhost` tile URLs
-- verify frontend proxy or gateway config
-
-### Docker build issues on Apple Silicon
-If needed, add this under affected services:
-
-```yaml
-platform: linux/amd64
-```
-
----
-
-## Architecture Overview
-
-```text
-[Browser / Dashboard]
-        │
-        ├──▶ [Visualization / app/app]
-        │
-        ├──▶ [Data Service] ──▶ [Tower cache / tile store / hotspot data]
-        │
-        └──▶ [Routing Engine] ──▶ [Graph + edge scoring + route selection]
-                           │
-                           └──▶ [Prediction Service]
-```
-
----
-
-## License
-
-MIT
+- If a city is warming, `POST /api/route` returns HTTP 202 with `Retry-After`; the
+  authoritative frontend waits and retries automatically.
+- If a port is occupied, stop the conflicting process before rerunning
+  `run-local.ps1`.
+- Heatmap tiles must use relative `/api/tiles/...` URLs so the Vite proxy and Nginx
+  gateway work consistently.
+- A 503 from `/ready` means the service is alive but its graph/model is not yet able
+  to serve dependent traffic. Inspect `/health` for diagnostic state.

@@ -12,6 +12,7 @@ from typing import Any
 import joblib
 import numpy as np
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import xgboost as xgb
 
@@ -706,6 +707,21 @@ def health() -> dict[str, str | float | bool]:
         "gpu_enabled": USE_GPU,
         "gpu_name": GPU_NAME,
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    model_ready = bool(MODEL is not None)
+    return JSONResponse(
+        status_code=200 if model_ready else 503,
+        content={
+            "status": "ready" if model_ready else "not_ready",
+            "service": "prediction-service",
+            "model_ready": model_ready,
+            "model_family": MODEL_FAMILY,
+            "model_device": MODEL_DEVICE,
+        },
+    )
 
 
 @app.get("/memory")

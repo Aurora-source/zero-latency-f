@@ -3,6 +3,26 @@ __pycache__/
 *.py[cod]
 *.pyo
 .env
+.env.*
+*.env
+*.env.*
+!.env.example
+!**/.env.example
+.netrc
+.npmrc
+.pypirc
+credentials/
+secrets/
+*credential*.json
+*credential*.yaml
+*credential*.yml
+*secret*.json
+*secret*.yaml
+*secret*.yml
+*.key
+*.pem
+*.p12
+*.pfx
 .venv/
 venv/
 *.egg-info/
@@ -34,11 +54,26 @@ Thumbs.db
 .vscode/
 
 # Docker / infra
-*.env.local
 docker-compose.override.yml
 
 # Runtime cache
 cache/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.wal
+*.shm
+*.journal
+route_cache.json
+api_key_state.json
+osmnx_cache/
+services/data-service/data/osmnx_cache/
+services/data-service/data/scores/
+services/data-service/data/towers/
+services/data-service/data/trai/
+*.mvt
+tiles/
 
 # Project-specific redundant files
 
@@ -48,6 +83,15 @@ nah.ps1
 # Binary archives
 app.rar
 services/visualization.zip
+*.zip
+*.tar
+*.tar.*
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
 
 # Stale logs
 services/visualization1/vite-start-test.log
@@ -76,6 +120,24 @@ app/app/node_modules/
 # Large data files
 *.graphml
 *.pkl
+*.pickle
+*.joblib
+*.onnx
+*.pt
+*.pth
+*.h5
 *.csv
 *.csv.gz
+*.parquet
+*.feather
+*.geojson
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.tif
+*.tiff
+*_raw.json
+*.osm
+*.pbf
 *.osm.pbf

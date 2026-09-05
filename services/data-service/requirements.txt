@@ -3,8 +3,10 @@ httpx==0.28.1
 mapbox-vector-tile==2.2.0
 mercantile==1.2.1
 networkx==3.4.2
+numpy==2.2.1
 osmnx==2.0.2
 pandas==2.2.3
+pyproj==3.7.0
 scipy==1.14.1
 shapely==2.0.6
 uvicorn[standard]==0.32.1

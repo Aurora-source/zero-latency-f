@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import csv
 import json
 import math
@@ -45,9 +46,10 @@ DEFAULT_HTTP_TIMEOUT_SECONDS = float(os.getenv("OPENCELLID_HTTP_TIMEOUT_SECONDS"
 LOCAL_TOWER_CSV_PATH = Path(
     os.getenv(
         "LOCAL_TOWER_CSV_PATH",
-        str(Path(__file__).resolve().parent / "data" / "towers" / "towers_bangalore.csv"),
+        str(Path(__file__).resolve().parent / "data" / "towers" / "bangalore_towers.csv"),
     )
 )
+LOCAL_TOWER_PROVENANCE = os.getenv("LOCAL_TOWER_PROVENANCE", "unknown")
 LOCAL_TOWER_SOURCE: dict[str, Any] | None = None
 
 
@@ -65,6 +67,7 @@ class TileRecord:
     max_lon: float
     is_cached: bool
     last_updated: str | None
+    last_attempt: str | None
     retry_count: int
     last_error: str | None
 
@@ -74,6 +77,29 @@ def _log(logger: Callable[[str], None] | None, message: str) -> None:
         print(message)
     else:
         logger(message)
+
+
+def normalize_tower_provenance(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "opencellid": "opencellid",
+        "open_cell_id": "opencellid",
+        "trai": "trai",
+        "trai_india": "trai",
+        "unknown": "unknown",
+    }
+    return aliases.get(normalized, "unknown")
+
+
+def _is_missing_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        return bool(math.isnan(float(value)))
+    except (TypeError, ValueError):
+        return False
 
 
 @contextmanager
@@ -104,6 +130,7 @@ def ensure_schema(db_path: Path) -> None:
                 max_lon REAL NOT NULL,
                 is_cached INTEGER NOT NULL DEFAULT 0,
                 last_updated TIMESTAMP,
+                last_attempt TIMESTAMP,
                 retry_count INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
             );
@@ -147,7 +174,8 @@ def ensure_schema(db_path: Path) -> None:
             CREATE TABLE IF NOT EXISTS coverage_tiles (
                 tile_id TEXT PRIMARY KEY REFERENCES tiles(tile_id) ON DELETE CASCADE,
                 city TEXT NOT NULL,
-                has_real_data INTEGER NOT NULL DEFAULT 0
+                has_real_data INTEGER NOT NULL DEFAULT 0,
+                source TEXT NOT NULL DEFAULT 'unknown'
             );
 
             CREATE INDEX IF NOT EXISTS idx_tiles_city_cached ON tiles(city, is_cached, last_updated);
@@ -155,6 +183,23 @@ def ensure_schema(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_tower_tile_map_tile ON tower_tile_map(tile_id);
             CREATE INDEX IF NOT EXISTS idx_coverage_tiles_city ON coverage_tiles(city, has_real_data);
             """
+        )
+        tile_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(tiles)").fetchall()
+        }
+        if "last_attempt" not in tile_columns:
+            conn.execute("ALTER TABLE tiles ADD COLUMN last_attempt TIMESTAMP")
+        coverage_columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(coverage_tiles)").fetchall()
+        }
+        if "source" not in coverage_columns:
+            conn.execute(
+                "ALTER TABLE coverage_tiles ADD COLUMN source TEXT NOT NULL DEFAULT 'unknown'"
+            )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tiles_retry ON tiles(city, is_cached, last_attempt)"
         )
 
 
@@ -226,6 +271,7 @@ def _load_tower_rows_from_csv(csv_path: Path) -> list[dict[str, Any]]:
 def load_local_tower_source(
     csv_path: Path | None = None,
     *,
+    source: str | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> dict[str, Any] | None:
     global LOCAL_TOWER_SOURCE
@@ -236,13 +282,17 @@ def load_local_tower_source(
         LOCAL_TOWER_SOURCE = None
         return None
 
+    LOCAL_TOWER_SOURCE = None
     rows = _load_tower_rows_from_csv(source_path)
     bounds = city_bounds("bangalore")
     towers: list[dict[str, Any]] = []
+    provenance_source = normalize_tower_provenance(source or LOCAL_TOWER_PROVENANCE)
     for row in rows:
         try:
             lat = float(row.get("lat") or 0.0)
             lon = float(row.get("lon") or 0.0)
+            raw_range = row.get("range")
+            tower_range = 500.0 if _is_missing_value(raw_range) else float(raw_range)
         except (TypeError, ValueError):
             continue
         if not (bounds["min_lat"] <= lat <= bounds["max_lat"] and bounds["min_lon"] <= lon <= bounds["max_lon"]):
@@ -251,22 +301,28 @@ def load_local_tower_source(
             {
                 "lat": lat,
                 "lon": lon,
-                "radio": str(row.get("radio") or "LTE").upper(),
-                "range": float(row.get("range") or 500.0),
+                "radio": (
+                    "LTE"
+                    if _is_missing_value(row.get("radio"))
+                    else str(row.get("radio")).upper()
+                ),
+                "range": tower_range,
                 "mcc": _optional_int(row.get("mcc")),
                 "mnc": _optional_int(row.get("mnc")),
                 "lac": _optional_int(row.get("lac")),
                 "cellid": _optional_int(row.get("cellid")),
+                "provenance_source": provenance_source,
             }
         )
 
     towers = dedupe_towers(towers)
     latitudes = np.asarray([tower["lat"] for tower in towers], dtype=np.float32)
     longitudes = np.asarray([tower["lon"] for tower in towers], dtype=np.float32)
-    coordinates = np.column_stack((latitudes, longitudes)) if len(towers) else np.empty((0, 2), dtype=np.float32)
-    tree = cKDTree(coordinates) if cKDTree is not None and len(towers) else None
+    coordinates = np.column_stack((latitudes, longitudes)) if towers else np.empty((0, 2), dtype=np.float32)
+    tree = cKDTree(coordinates) if cKDTree is not None and towers else None
 
     LOCAL_TOWER_SOURCE = {
+        "source": provenance_source,
         "path": str(source_path),
         "towers": towers,
         "latitudes": latitudes,
@@ -282,11 +338,17 @@ def load_local_tower_source(
 
 def local_tower_source_status() -> dict[str, Any]:
     if LOCAL_TOWER_SOURCE is None:
-        return {"loaded": False, "count": 0, "path": str(LOCAL_TOWER_CSV_PATH)}
+        return {
+            "loaded": False,
+            "count": 0,
+            "path": str(LOCAL_TOWER_CSV_PATH),
+            "source": "unknown",
+        }
     return {
         "loaded": True,
         "count": int(LOCAL_TOWER_SOURCE.get("count") or 0),
         "path": str(LOCAL_TOWER_SOURCE.get("path") or LOCAL_TOWER_CSV_PATH),
+        "source": normalize_tower_provenance(LOCAL_TOWER_SOURCE.get("source")),
     }
 
 
@@ -311,8 +373,10 @@ def local_towers_for_bbox(
         center_lat = (min_lat + max_lat) / 2.0
         center_lon = (min_lon + max_lon) / 2.0
         radius = math.hypot((max_lat - min_lat) / 2.0, (max_lon - min_lon) / 2.0)
-        candidate_indexes = tree.query_ball_point([center_lat, center_lon], r=max(radius, 1e-6))
-        candidate_indexes = np.asarray(candidate_indexes, dtype=np.int32)
+        candidate_indexes = np.asarray(
+            tree.query_ball_point([center_lat, center_lon], r=max(radius, 1e-6)),
+            dtype=np.int32,
+        )
     else:
         candidate_indexes = np.arange(len(towers), dtype=np.int32)
 
@@ -336,6 +400,54 @@ def city_bounds(city: str) -> dict[str, float]:
     if city_slug not in CITY_BBOXES:
         raise ValueError(f"Unsupported tower-cache city '{city}'")
     return CITY_BBOXES[city_slug]
+
+
+def coverage_tile_ids_for_bbox(
+    city: str,
+    min_lat: float,
+    min_lon: float,
+    max_lat: float,
+    max_lon: float,
+) -> list[str]:
+    """Return bounded grid candidates; callers may apply exact geometry checks."""
+    city_slug = city.strip().lower()
+    bounds = city_bounds(city_slug)
+    avg_lat = (bounds["min_lat"] + bounds["max_lat"]) / 2.0
+    lat_step = TILE_SIDE_METERS / 111_000.0
+    lon_step = TILE_SIDE_METERS / (
+        111_000.0 * max(math.cos(math.radians(avg_lat)), 0.2)
+    )
+    row_count = max(
+        1,
+        int(math.ceil((bounds["max_lat"] - bounds["min_lat"]) / lat_step)),
+    )
+    col_count = max(
+        1,
+        int(math.ceil((bounds["max_lon"] - bounds["min_lon"]) / lon_step)),
+    )
+    row_start = max(
+        0,
+        int(math.floor((min_lat - bounds["min_lat"]) / lat_step)) - 1,
+    )
+    row_end = min(
+        row_count - 1,
+        int(math.floor((max_lat - bounds["min_lat"]) / lat_step)) + 1,
+    )
+    col_start = max(
+        0,
+        int(math.floor((min_lon - bounds["min_lon"]) / lon_step)) - 1,
+    )
+    col_end = min(
+        col_count - 1,
+        int(math.floor((max_lon - bounds["min_lon"]) / lon_step)) + 1,
+    )
+    if row_start > row_end or col_start > col_end:
+        return []
+    return [
+        f"{city_slug}_{row:03d}_{col:03d}"
+        for row in range(row_start, row_end + 1)
+        for col in range(col_start, col_end + 1)
+    ]
 
 
 def generate_city_tiles(city: str) -> list[TileRecord]:
@@ -363,6 +475,7 @@ def generate_city_tiles(city: str) -> list[TileRecord]:
                     max_lon=round(next_lon, 6),
                     is_cached=False,
                     last_updated=None,
+                    last_attempt=None,
                     retry_count=0,
                     last_error=None,
                 )
@@ -416,6 +529,7 @@ def _row_to_tile(row: sqlite3.Row) -> TileRecord:
         max_lon=float(row["max_lon"]),
         is_cached=bool(row["is_cached"]),
         last_updated=row["last_updated"],
+        last_attempt=row["last_attempt"],
         retry_count=int(row["retry_count"] or 0),
         last_error=row["last_error"],
     )
@@ -428,8 +542,11 @@ def tiles_for_bbox(
     min_lon: float,
     max_lat: float,
     max_lon: float,
+    *,
+    ensure_tiles: bool = True,
 ) -> list[TileRecord]:
-    ensure_city_tiles(db_path, city)
+    if ensure_tiles:
+        ensure_city_tiles(db_path, city)
     city_slug = city.strip().lower()
     with connect_db(db_path) as conn:
         rows = conn.execute(
@@ -453,15 +570,31 @@ def tiles_for_bbox(
 def cache_status(db_path: Path, city: str = "bangalore") -> dict[str, int | float | str]:
     summary = ensure_city_tiles(db_path, city)
     total_tiles = int(summary["total_tiles"])
-    cached_tiles = int(summary["cached_tiles"])
+    fresh_cutoff = int(time.time() - TILE_STALE_SECONDS)
+    with connect_db(db_path) as conn:
+        cached_row = conn.execute(
+            """
+            SELECT COUNT(*) FROM tiles
+            WHERE city = ? AND is_cached = 1 AND last_updated IS NOT NULL
+              AND CAST(strftime('%s', last_updated) AS INTEGER) >= ?
+            """,
+            (city.strip().lower(), fresh_cutoff),
+        ).fetchone()
+        coverage_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM coverage_tiles AS coverage
+            JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
+            WHERE coverage.city = ? AND coverage.has_real_data = 1
+              AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
+              AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
+            """,
+            (city.strip().lower(), fresh_cutoff),
+        ).fetchone()
+    cached_tiles = int(cached_row[0]) if cached_row is not None else 0
     remaining_tiles = max(total_tiles - cached_tiles, 0)
     percent_complete = round((cached_tiles / max(total_tiles, 1)) * 100.0, 1)
-    with connect_db(db_path) as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) FROM coverage_tiles WHERE city = ? AND has_real_data = 1",
-            (city.strip().lower(),),
-        ).fetchone()
-    real_coverage_tiles = int(row[0]) if row is not None else 0
+    real_coverage_tiles = int(coverage_row[0]) if coverage_row is not None else 0
     real_coverage_percent = round((real_coverage_tiles / max(total_tiles, 1)) * 100.0, 1)
     return {
         "city": city.strip().lower(),
@@ -474,6 +607,25 @@ def cache_status(db_path: Path, city: str = "bangalore") -> dict[str, int | floa
     }
 
 
+def fresh_covered_tile_ids(db_path: Path, city: str = "bangalore") -> list[str]:
+    ensure_city_tiles(db_path, city)
+    fresh_cutoff = int(time.time() - TILE_STALE_SECONDS)
+    with connect_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT tile.tile_id
+            FROM tiles AS tile
+            JOIN coverage_tiles AS coverage ON coverage.tile_id = tile.tile_id
+            WHERE tile.city = ? AND coverage.has_real_data = 1
+              AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
+              AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
+            ORDER BY tile.tile_id
+            """,
+            (city.strip().lower(), fresh_cutoff),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def stale_tile_ids(db_path: Path, city: str, *, limit: int | None = None) -> list[str]:
     ensure_city_tiles(db_path, city)
     city_slug = city.strip().lower()
@@ -481,12 +633,12 @@ def stale_tile_ids(db_path: Path, city: str, *, limit: int | None = None) -> lis
     retry_cutoff = time.time() - TILE_ERROR_RETRY_SECONDS
     sql = (
         "SELECT tile_id FROM tiles "
-        "WHERE city = ? AND ("
-        "  (is_cached = 0 AND (last_updated IS NULL OR CAST(strftime('%s', last_updated) AS INTEGER) < ?))"
-        "  OR "
-        "  (is_cached = 1 AND (last_updated IS NULL OR CAST(strftime('%s', last_updated) AS INTEGER) < ?))"
-        ") "
-        "ORDER BY is_cached ASC, COALESCE(last_updated, '') ASC, retry_count ASC, tile_id ASC"
+        "WHERE city = ? "
+        "AND (last_attempt IS NULL OR CAST(strftime('%s', last_attempt) AS INTEGER) < ?) "
+        "AND (is_cached = 0 OR last_updated IS NULL "
+        "     OR CAST(strftime('%s', last_updated) AS INTEGER) < ?) "
+        "ORDER BY is_cached ASC, COALESCE(last_attempt, last_updated, '') ASC, "
+        "retry_count ASC, tile_id ASC"
     )
     params: list[Any] = [city_slug, int(retry_cutoff), int(stale_cutoff)]
     if limit is not None:
@@ -511,8 +663,18 @@ def cached_towers_for_bbox(
     min_lon: float,
     max_lat: float,
     max_lon: float,
+    *,
+    ensure_tiles: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str], set[str], list[TileRecord]]:
-    query_tiles = tiles_for_bbox(db_path, city, min_lat, min_lon, max_lat, max_lon)
+    query_tiles = tiles_for_bbox(
+        db_path,
+        city,
+        min_lat,
+        min_lon,
+        max_lat,
+        max_lon,
+        ensure_tiles=ensure_tiles,
+    )
     cutoff = time.time() - TILE_STALE_SECONDS
     tile_ids = [tile.tile_id for tile in query_tiles]
     coverage_rows: list[sqlite3.Row] = []
@@ -542,7 +704,7 @@ def cached_towers_for_bbox(
             and _timestamp_seconds(tile.last_updated) >= cutoff
         )
     ]
-    stale_or_missing_tile_ids = {
+    missing_tile_ids = sorted(
         tile.tile_id
         for tile in query_tiles
         if (
@@ -551,11 +713,11 @@ def cached_towers_for_bbox(
             or not tile.last_updated
             or _timestamp_seconds(tile.last_updated) < cutoff
         )
-    }
-    missing_tile_ids = sorted(stale_or_missing_tile_ids)
+    )
 
+    fresh_covered_tile_ids = set(cached_tile_ids)
     if not cached_tile_ids:
-        return [], missing_tile_ids, covered_tile_ids, query_tiles
+        return [], missing_tile_ids, fresh_covered_tile_ids, query_tiles
 
     placeholders = ",".join("?" for _ in cached_tile_ids)
     sql = f"""
@@ -589,7 +751,33 @@ def cached_towers_for_bbox(
         }
         for row in rows
     ]
-    return towers, missing_tile_ids, covered_tile_ids, query_tiles
+    return towers, missing_tile_ids, fresh_covered_tile_ids, query_tiles
+
+
+def coverage_sources_for_tiles(
+    db_path: Path,
+    tile_ids: set[str],
+    *,
+    ensure_database: bool = True,
+) -> dict[str, str]:
+    if not tile_ids:
+        return {}
+    if ensure_database:
+        ensure_schema(db_path)
+    placeholders = ",".join("?" for _ in tile_ids)
+    with connect_db(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT tile_id, source
+            FROM coverage_tiles
+            WHERE has_real_data = 1 AND tile_id IN ({placeholders})
+            """,
+            sorted(tile_ids),
+        ).fetchall()
+    return {
+        str(row["tile_id"]): normalize_tower_provenance(row["source"])
+        for row in rows
+    }
 
 
 def _optional_int(value: Any) -> int | None:
@@ -605,7 +793,7 @@ def _timestamp_seconds(value: str | None) -> int:
     if not value:
         return 0
     try:
-        return int(time.mktime(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
+        return int(calendar.timegm(time.strptime(value, "%Y-%m-%dT%H:%M:%SZ")))
     except ValueError:
         return 0
 
@@ -638,10 +826,21 @@ def store_tile_towers(
     tile_id: str,
     towers: list[dict[str, Any]],
     *,
+    source: str | None = None,
     error_message: str | None = None,
 ) -> int:
     ensure_schema(db_path)
     unique_towers = dedupe_towers(towers)
+    tower_sources = {
+        normalize_tower_provenance(
+            tower.get("provenance_source") or tower.get("source")
+        )
+        for tower in unique_towers
+    }
+    tower_sources.discard("unknown")
+    stored_source = normalize_tower_provenance(source)
+    if stored_source == "unknown" and len(tower_sources) == 1:
+        stored_source = next(iter(tower_sources))
     now_iso = _now_iso()
     with connect_db(db_path) as conn:
         conn.execute("BEGIN")
@@ -650,42 +849,54 @@ def store_tile_towers(
             for tower in unique_towers:
                 lat = round(float(tower.get("lat") or 0.0), 6)
                 lon = round(float(tower.get("lon") or 0.0), 6)
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO towers (
-                        lat, lon, mcc, mnc, lac, cellid, radio, range, tile_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        lat,
-                        lon,
-                        _optional_int(tower.get("mcc")),
-                        _optional_int(tower.get("mnc")),
-                        _optional_int(tower.get("lac")),
-                        _optional_int(tower.get("cellid")),
-                        str(tower.get("radio") or "LTE").upper(),
-                        float(tower.get("range") or 500.0),
-                        tile_id,
-                    ),
-                )
+                mcc = _optional_int(tower.get("mcc"))
+                mnc = _optional_int(tower.get("mnc"))
+                lac = _optional_int(tower.get("lac"))
+                cellid = _optional_int(tower.get("cellid"))
+                radio = str(tower.get("radio") or "LTE").upper()
+                tower_range = float(tower.get("range") or 500.0)
                 row = conn.execute(
                     """
                     SELECT id FROM towers
-                    WHERE mcc IS ? AND mnc IS ? AND lac IS ? AND cellid IS ? AND radio = ? AND lat = ? AND lon = ?
+                    WHERE mcc IS ? AND mnc IS ? AND lac IS ? AND cellid IS ?
+                      AND radio = ? AND lat = ? AND lon = ?
                     """,
                     (
-                        _optional_int(tower.get("mcc")),
-                        _optional_int(tower.get("mnc")),
-                        _optional_int(tower.get("lac")),
-                        _optional_int(tower.get("cellid")),
-                        str(tower.get("radio") or "LTE").upper(),
+                        mcc,
+                        mnc,
+                        lac,
+                        cellid,
+                        radio,
                         lat,
                         lon,
                     ),
                 ).fetchone()
                 if row is None:
-                    continue
-                tower_id = int(row["id"])
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO towers (
+                            lat, lon, mcc, mnc, lac, cellid, radio, range, tile_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            lat,
+                            lon,
+                            mcc,
+                            mnc,
+                            lac,
+                            cellid,
+                            radio,
+                            tower_range,
+                            tile_id,
+                        ),
+                    )
+                    tower_id = int(cursor.lastrowid)
+                else:
+                    tower_id = int(row["id"])
+                    conn.execute(
+                        "UPDATE towers SET range = ? WHERE id = ?",
+                        (tower_range, tower_id),
+                    )
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO tower_tile_map (tower_id, tile_id) VALUES (?, ?)
@@ -733,10 +944,11 @@ def store_tile_towers(
             conn.execute(
                 """
                 UPDATE tiles
-                SET is_cached = 1, last_updated = ?, last_error = ?, retry_count = 0
+                SET is_cached = 1, last_updated = ?, last_attempt = ?,
+                    last_error = ?, retry_count = 0
                 WHERE tile_id = ?
                 """,
-                (now_iso, error_message, tile_id),
+                (now_iso, now_iso, error_message, tile_id),
             )
             tile_row = conn.execute(
                 "SELECT city FROM tiles WHERE tile_id = ?",
@@ -744,16 +956,17 @@ def store_tile_towers(
             ).fetchone()
             conn.execute(
                 """
-                INSERT INTO coverage_tiles (tile_id, city, has_real_data)
-                VALUES (?, ?, ?)
+                INSERT INTO coverage_tiles (tile_id, city, has_real_data, source)
+                VALUES (?, ?, 1, ?)
                 ON CONFLICT(tile_id) DO UPDATE SET
                     city = excluded.city,
-                    has_real_data = excluded.has_real_data
+                    has_real_data = excluded.has_real_data,
+                    source = excluded.source
                 """,
                 (
                     tile_id,
                     str(tile_row["city"]) if tile_row is not None else "bangalore",
-                    1 if len(unique_towers) > 0 else 0,
+                    stored_source,
                 ),
             )
             conn.execute("COMMIT")
@@ -794,7 +1007,7 @@ def mark_tile_error(db_path: Path, tile_id: str, error_message: str) -> None:
         conn.execute(
             """
             UPDATE tiles
-            SET last_error = ?, retry_count = retry_count + 1, last_updated = ?
+            SET last_error = ?, retry_count = retry_count + 1, last_attempt = ?
             WHERE tile_id = ?
             """,
             (error_message[:500], now_iso, tile_id),
@@ -922,15 +1135,7 @@ async def fetch_area_size(
             "Accept": "application/json",
         },
     )
-    message = extract_error_message(response)
-    if response.status_code == 429 or "daily limit exceeded" in message.lower():
-        raise QuotaExceededError(message or f"HTTP {response.status_code}")
-    response.raise_for_status()
-    payload = response.json()
-    if isinstance(payload, dict) and "error" in payload:
-        if "daily limit exceeded" in str(payload["error"]).lower():
-            raise QuotaExceededError(str(payload["error"]))
-        raise RuntimeError(f"OpenCellID size error: {payload['error']}")
+    payload = validated_opencellid_payload(response, request_name="size")
     try:
         return int(payload.get("count", 0))
     except (AttributeError, TypeError, ValueError):
@@ -962,15 +1167,7 @@ async def fetch_area_page(
             "Accept": "application/json",
         },
     )
-    message = extract_error_message(response)
-    if response.status_code == 429 or "daily limit exceeded" in message.lower():
-        raise QuotaExceededError(message or f"HTTP {response.status_code}")
-    response.raise_for_status()
-    payload = response.json()
-    if isinstance(payload, dict) and "error" in payload:
-        if "daily limit exceeded" in str(payload["error"]).lower():
-            raise QuotaExceededError(str(payload["error"]))
-        raise RuntimeError(f"OpenCellID page error: {payload['error']}")
+    payload = validated_opencellid_payload(response, request_name="page")
     raw_cells = payload.get("cells", []) if isinstance(payload, dict) else []
     towers: list[dict[str, Any]] = []
     for cell in raw_cells:
@@ -985,6 +1182,7 @@ async def fetch_area_page(
                     "cellid": _optional_int(cell.get("cellid") or cell.get("cell")),
                     "radio": str(cell.get("radio") or "LTE").upper(),
                     "range": float(cell.get("range") or 500.0),
+                    "provenance_source": "opencellid",
                 }
             )
         except (TypeError, ValueError):
@@ -992,14 +1190,34 @@ async def fetch_area_page(
     return towers
 
 
-def extract_error_message(response: httpx.Response) -> str:
+def validated_opencellid_payload(
+    response: httpx.Response,
+    *,
+    request_name: str,
+) -> Any:
+    remote_message = ""
     try:
         payload = response.json()
         if isinstance(payload, dict):
-            return str(payload.get("error") or payload.get("message") or response.text[:200])
+            remote_message = str(payload.get("error") or payload.get("message") or "")
     except Exception:
-        pass
-    return response.text[:200]
+        payload = None
+        try:
+            remote_message = response.text[:500]
+        except Exception:
+            remote_message = ""
+
+    if response.status_code == 429 or "daily limit exceeded" in remote_message.lower():
+        raise QuotaExceededError("OpenCellID quota exceeded")
+    if not 200 <= int(response.status_code) < 300:
+        raise RuntimeError(
+            f"OpenCellID {request_name} request failed with HTTP {response.status_code}"
+        )
+    if payload is None:
+        raise RuntimeError(f"OpenCellID {request_name} response was not valid JSON")
+    if isinstance(payload, dict) and (payload.get("error") or payload.get("message")):
+        raise RuntimeError(f"OpenCellID {request_name} response reported an error")
+    return payload
 
 
 async def fetch_tower_chunk(
@@ -1034,19 +1252,16 @@ async def fetch_tower_chunk(
         f"{chunk_number}: bbox=({chunk_min_lat:.4f},{chunk_min_lon:.4f},{chunk_max_lat:.4f},{chunk_max_lon:.4f})",
     )
     while True:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("OpenCellID fetch interrupted")
         if key_manager is not None:
-            if key_manager.cooldown_active():
-                _log(logger, "[api-key] cooldown active")
-                raise RuntimeError("OpenCellID API key cooldown active")
             if not key_manager.has_available_key():
-                _log(logger, "[api-key] all keys exhausted - sleeping")
-                raise RuntimeError("OpenCellID API key cooldown active")
-            try:
-                current_token = key_manager.get_current_key()
-            except RuntimeError as exc:
-                if "cooldown active" in str(exc).lower():
-                    _log(logger, "[api-key] cooldown active")
-                raise
+                if stop_event is None:
+                    raise RuntimeError("OpenCellID API keys are temporarily unavailable")
+                _log(logger, "[api-key] all keys exhausted — worker waiting")
+                if not key_manager.wait_until_available(stop_event):
+                    raise RuntimeError("OpenCellID key wait interrupted")
+            current_token = key_manager.get_current_key()
         else:
             current_token = token
 
@@ -1063,6 +1278,8 @@ async def fetch_tower_chunk(
                 return []
             towers: list[dict[str, Any]] = []
             for offset in range(0, count, OPENCELLID_PAGE_LIMIT):
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError("OpenCellID fetch interrupted")
                 page = await fetch_area_page(
                     client,
                     chunk_min_lat,
@@ -1079,13 +1296,13 @@ async def fetch_tower_chunk(
             if key_manager is None:
                 raise
             _log(logger, "[api-key] quota message - rotating key")
-            key_manager.mark_exhausted(reason=str(exc))
+            key_manager.mark_current_exhausted(reason=str(exc))
             continue
         except RuntimeError as exc:
             message = str(exc).lower()
             if key_manager is not None and "daily limit" in message:
                 _log(logger, "[api-key] exception quota hit - rotating key")
-                key_manager.mark_exhausted(reason=str(exc))
+                key_manager.mark_current_exhausted(reason=str(exc))
                 continue
             raise
 
@@ -1094,9 +1311,11 @@ def export_schema() -> dict[str, str]:
     return {
         "tiles": (
             "tile_id TEXT PRIMARY KEY, min_lat REAL, max_lat REAL, min_lon REAL, max_lon REAL, "
-            "is_cached INTEGER, last_updated TIMESTAMP"
+            "is_cached INTEGER, last_updated TIMESTAMP, last_attempt TIMESTAMP"
         ),
         "towers": "id INTEGER PRIMARY KEY, lat REAL, lon REAL, mcc INTEGER, mnc INTEGER, lac INTEGER, cellid INTEGER, radio TEXT, tile_id TEXT",
-        "coverage_tiles": "tile_id TEXT PRIMARY KEY, city TEXT, has_real_data INTEGER",
+        "coverage_tiles": (
+            "tile_id TEXT PRIMARY KEY, city TEXT, has_real_data INTEGER, source TEXT"
+        ),
         "rtree": "tiles_rtree(rowid, min_lon, max_lon, min_lat, max_lat), towers_rtree(id, min_lon, max_lon, min_lat, max_lat)",
     }

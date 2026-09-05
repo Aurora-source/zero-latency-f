@@ -59,12 +59,22 @@ class APIKeyManager:
             return
         try:
             payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except Exception:
+            loaded_index = int(payload.get("current_key_index", 0) or 0)
+            loaded_exhausted = {
+                int(index) for index in payload.get("exhausted_keys", [])
+            }
+            loaded_last_reset = str(
+                payload.get("last_reset_time") or self._utc_day_token()
+            )
+            loaded_next_retry = float(payload.get("next_retry_time") or 0.0)
+        except (AttributeError, TypeError, ValueError, json.JSONDecodeError, OSError):
             return
-        self.current_key_index = int(payload.get("current_key_index", 0) or 0)
-        self.exhausted_keys = {int(index) for index in payload.get("exhausted_keys", [])}
-        self.last_reset_time = str(payload.get("last_reset_time") or self._utc_day_token())
-        self.next_retry_time = float(payload.get("next_retry_time") or 0.0)
+        self.current_key_index = loaded_index % len(self.keys) if self.keys else 0
+        self.exhausted_keys = {
+            index for index in loaded_exhausted if 0 <= index < len(self.keys)
+        }
+        self.last_reset_time = loaded_last_reset
+        self.next_retry_time = loaded_next_retry
         self._reset_if_new_day_locked()
 
     def _save_state(self) -> None:
@@ -122,7 +132,7 @@ class APIKeyManager:
             if next_index is None:
                 self.next_retry_time = time.time() + self.seconds_until_next_utc_midnight()
                 self._save_state()
-                self.logger("[api-key] all keys exhausted - sleeping")
+                self.logger("[api-key] all keys exhausted — sleeping")
                 return
             self.next_retry_time = 0.0
             self.current_key_index = next_index
@@ -133,6 +143,7 @@ class APIKeyManager:
             )
 
     def mark_exhausted(self, *, reason: str = "") -> None:
+        """Backward-compatible alias used by ingestion call sites."""
         self.mark_current_exhausted(reason=reason)
 
     def has_available_key(self) -> bool:
@@ -161,9 +172,14 @@ class APIKeyManager:
         while True:
             with self._lock:
                 self._reset_if_new_day_locked()
-                if self._first_available_index_locked() is not None:
+                cooldown_active = self.cooldown_active_locked()
+                if not cooldown_active and self._first_available_index_locked() is not None:
                     return True
-                seconds = self.seconds_until_next_utc_midnight()
+                seconds = (
+                    max(int(self.next_retry_time - time.time()), 1)
+                    if cooldown_active
+                    else self.seconds_until_next_utc_midnight()
+                )
             wait_seconds = min(max(seconds, 1), 60)
             if stop_event is not None and stop_event.wait(wait_seconds):
                 return False
@@ -193,7 +209,7 @@ class APIKeyManager:
                 "total_keys": len(self.keys),
                 "active_key": (active_index + 1) if active_index is not None else None,
                 "exhausted_keys": [index + 1 for index in sorted(self.exhausted_keys)],
-                "remaining_keys": len(self.keys) - len(self.exhausted_keys),
+                "remaining_keys": max(len(self.keys) - len(self.exhausted_keys), 0),
                 "cooldown_active": cooldown_active,
                 "next_retry_seconds": next_retry_seconds,
             }

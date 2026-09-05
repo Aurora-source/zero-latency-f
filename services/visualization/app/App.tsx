@@ -30,6 +30,7 @@ import type {
   FormattedRoute,
   ScoreSourceInfo,
   Strategy,
+  Vehicle,
   ViewportBounds,
 } from "./lib/api";
 import {
@@ -83,19 +84,15 @@ const ROUTE_COLORS: Record<Strategy, string> = {
   fastest: "#3b82f6",
 };
 const VEHICLE_OPTIONS: Array<{
-  id: VehicleChoice;
+  id: Vehicle;
   label: string;
   icon: LucideIcon;
 }> = [
-  { id: "two_wheeler", label: "Two Wheeler", icon: Bike },
+  { id: "scooter", label: "Scooter", icon: Bike },
+  { id: "bike", label: "Bike", icon: Bike },
   { id: "car", label: "Car", icon: Car },
   { id: "truck", label: "Truck", icon: Truck },
 ];
-type VehicleChoice = "two_wheeler" | "car" | "truck";
-
-function backendVehicleForSelection(vehicle: VehicleChoice) {
-  return vehicle === "two_wheeler" ? "scooter" : vehicle;
-}
 
 function buildRouteSlots(state: RouteSlotState): Record<Strategy, RouteSlot> {
   return {
@@ -157,16 +154,12 @@ async function reverseGeocode([lat, lon]: Coordinates): Promise<string | null> {
   return null;
 }
 
-function strategyForRoute(routeId: number): Strategy {
-  if (routeId === 0) return "connected";
-  if (routeId === 2) return "fastest";
-  return "balanced";
-}
-
 function scoreSourceLabel(source: ScoreSourceInfo | null) {
   if (!source) return null;
-  if (source.source === "TRAI") return "TRAI India";
-  if (source.source === "OpenCellID") return "OpenCellID";
+  if (source.provenanceSource === "trai") return "TRAI India";
+  if (source.provenanceSource === "opencellid") return "OpenCellID";
+  if (source.provenanceSource === "hybrid") return "Hybrid real and estimated data";
+  if (source.provenanceSource === "unknown") return "Unknown provenance";
   return "ML estimate";
 }
 
@@ -175,7 +168,7 @@ export default function App() {
   const [selectedRoute, setSelectedRoute] = useState(1);
   const [connectivityWeight, setConnectivityWeight] = useState(50);
   const [darkMode, setDarkMode] = useState(false);
-  const [selectedVehicle, setSelectedVehicle] = useState<VehicleChoice>("car");
+  const [selectedVehicle, setSelectedVehicle] = useState<Vehicle>("car");
 
   const [hotspots, setHotspots] = useState<Hotspot[]>([]);
   const [cityList, setCityList] = useState<string[]>([]);
@@ -221,19 +214,17 @@ export default function App() {
     () => ROUTE_ORDER.some((strategy) => routeSlots[strategy].state === "loading"),
     [routeSlots],
   );
-  const cityLabel = useMemo(
-    () => (selectedCity ? formatCityName(selectedCity) : "Select city"),
-    [selectedCity],
-  );
   const selectedRouteData = useMemo(
     () => routes.find((route) => route.id === selectedRoute) ?? null,
     [routes, selectedRoute],
   );
-  const activeCoveragePercent =
-    selectedRouteData?.coveragePercent ??
-    coverageStatus?.coverage_percent ??
-    coverageStatus?.real_coverage_percent ??
+  const activeRealDataCoveragePercent =
+    selectedRouteData?.realDataCoveragePercent ??
+    coverageStatus?.real_data_coverage_percent ??
+    scoreSource?.real_data_coverage_percent ??
     0;
+  const activeGoodSignalPercent =
+    selectedRouteData?.goodSignalPercent ?? scoreSource?.good_signal_percent ?? 0;
   const hasRouteInputs = Boolean(selectedCity && origin && destination);
   const hasRouteErrors = useMemo(
     () => ROUTE_ORDER.some((strategy) => routeSlots[strategy].state === "error"),
@@ -554,35 +545,19 @@ export default function App() {
   }, [selectedCity]);
 
   useEffect(() => {
-    console.log("coverage percent:", activeCoveragePercent);
-  }, [activeCoveragePercent]);
-
-  useEffect(() => {
-    console.log("route source:", selectedRouteData?.signalSource ?? scoreSource?.source ?? "ML estimate");
-  }, [scoreSource?.source, selectedRouteData?.signalSource]);
-
-  useEffect(() => {
     let cancelled = false;
 
     const loadCoverageStatus = async () => {
       try {
         const status = await fetchCoverageStatus();
-        if (!cancelled) {
-          console.log("coverage percent:", status.coverage_percent);
-          setCoverageStatus(status);
-        }
+        if (!cancelled) setCoverageStatus(status);
       } catch {
-        if (!cancelled) {
-          setCoverageStatus(null);
-        }
+        if (!cancelled) setCoverageStatus(null);
       }
     };
 
     void loadCoverageStatus();
-    const intervalId = window.setInterval(() => {
-      void loadCoverageStatus();
-    }, 30000);
-
+    const intervalId = window.setInterval(loadCoverageStatus, 30000);
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
@@ -609,7 +584,7 @@ export default function App() {
             origin,
             destination,
             strategy,
-            vehicle: backendVehicleForSelection(selectedVehicle),
+            vehicle: selectedVehicle,
           });
 
           if (cancelled || requestId !== requestSequence.current) {
@@ -669,7 +644,7 @@ export default function App() {
       if (!successfulLoads.length) {
         const failedMessages = results
           .filter(
-            (result): result is PromiseFulfilledResult<RouteLoadResult> =>
+            (result): result is PromiseFulfilledResult<Extract<RouteLoadResult, { status: "error" }>> =>
               result.status === "fulfilled" && result.value.status === "error",
           )
           .map((result) => result.value.message);
@@ -943,17 +918,15 @@ export default function App() {
         {selectedRouteData?.signalDataLabel || scoreSource ? (
           <div
             className={`rounded-xl border px-3 py-2 text-xs backdrop-blur-xl ${
-              activeCoveragePercent > 0
+              activeRealDataCoveragePercent > 0
                 ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-100"
                 : "border-amber-300/30 bg-amber-500/10 text-amber-100"
             }`}
           >
             Signal data: {selectedRouteData?.signalDataLabel ?? scoreSourceLabel(scoreSource)}
-            {coverageStatus ? (
-              <span className="ml-2 text-[11px] opacity-80">
-                {activeCoveragePercent.toFixed(1)}% real
-              </span>
-            ) : null}
+            <span className="ml-2 text-[11px] opacity-80">
+              {activeRealDataCoveragePercent.toFixed(1)}% real · {activeGoodSignalPercent.toFixed(1)}% good signal
+            </span>
           </div>
         ) : null}
 

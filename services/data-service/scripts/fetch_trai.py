@@ -7,8 +7,8 @@ import httpx
 
 OPENCELLID_TOKEN = os.environ.get(
     "OPENCELLID_TOKEN",
-    "pk.37dddd741049308fd26c175be7a5aea0",
-)
+    "",
+).strip()
 
 CITY_BBOXES = {
     "bangalore": {
@@ -31,21 +31,30 @@ TOWER_DIR = SERVICE_DIR / "data" / "towers"
 
 
 def main() -> None:
+    if not OPENCELLID_TOKEN:
+        raise SystemExit(
+            "OPENCELLID_TOKEN is required for this optional fetch; no request was made."
+        )
+
     TOWER_DIR.mkdir(parents=True, exist_ok=True)
 
     for city, bbox in CITY_BBOXES.items():
-        url = (
-            "https://opencellid.org/cell/getInArea"
-            f"?token={OPENCELLID_TOKEN}"
-            f"&BBOX={bbox['min_lat']},{bbox['min_lon']},{bbox['max_lat']},{bbox['max_lon']}"
-            "&format=csv"
-        )
+        url = "https://opencellid.org/cell/getInArea"
+        params = {
+            "token": OPENCELLID_TOKEN,
+            "BBOX": (
+                f"{bbox['min_lat']},{bbox['min_lon']},"
+                f"{bbox['max_lat']},{bbox['max_lon']}"
+            ),
+            "format": "csv",
+        }
         output_path = TOWER_DIR / f"{city}_towers.csv"
 
-        print(f"[fetch] calling OpenCelliD bbox API for {city}...")
+        print(f"[fetch] calling OpenCellID bbox API for {city}...")
         try:
             response = httpx.get(
                 url,
+                params=params,
                 timeout=120,
                 follow_redirects=True,
                 headers={
@@ -55,7 +64,6 @@ def main() -> None:
             )
             print(f"[fetch] HTTP {response.status_code}")
             print(f"[fetch] Content length: {len(response.content)} bytes")
-            print(f"[fetch] First 300 chars: {response.text[:300]}")
 
             if response.status_code == 200:
                 first_line = response.text.strip().split("\n", 1)[0]
@@ -64,11 +72,11 @@ def main() -> None:
                     tower_count = max(len(response.text.strip().splitlines()) - 1, 0)
                     print(f"[fetch] OK {city}: {tower_count} towers saved")
                 else:
-                    print(f"[fetch] ERROR Not CSV: {response.text[:300]}")
+                    print("[fetch] ERROR Response was not a recognized CSV payload")
             else:
-                print(f"[fetch] ERROR HTTP {response.status_code}: {response.text[:300]}")
+                print(f"[fetch] ERROR HTTP {response.status_code}")
         except Exception as exc:
-            print(f"[fetch] ERROR {city}: {type(exc).__name__}: {exc}")
+            print(f"[fetch] ERROR {city}: {type(exc).__name__}; request failed")
 
 
 if __name__ == "__main__":

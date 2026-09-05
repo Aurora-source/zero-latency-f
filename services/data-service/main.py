@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import csv
 import gc
 import json
 import math
@@ -27,7 +26,7 @@ import numpy as np
 import osmnx as ox
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 from pyproj import Transformer
 from shapely import wkt
@@ -36,16 +35,19 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shapely_transform
 
 SERVICE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = SERVICE_DIR.parents[1]
 if str(SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(SERVICE_DIR))
 
 from api_key_manager import APIKeyManager
 from tile_loader import (
+    TILE_STALE_SECONDS,
     cache_status as persistent_cache_status,
     cached_towers_for_bbox,
+    coverage_tile_ids_for_bbox,
+    coverage_sources_for_tiles,
     ensure_city_tiles,
     fetch_bbox_towers_live,
+    fresh_covered_tile_ids,
     local_tower_source_status,
     load_local_tower_source,
     tile_bounds as cached_tile_bounds,
@@ -76,6 +78,43 @@ except ImportError:
 
 app = FastAPI(title="Connectivity-Aware Data Service", version="0.3.0")
 
+PROVENANCE_OPENCELLID = "opencellid"
+PROVENANCE_TRAI = "trai"
+PROVENANCE_ML_SYNTHETIC = "ml_synthetic"
+PROVENANCE_HYBRID = "hybrid"
+PROVENANCE_UNKNOWN = "unknown"
+PROVENANCE_ALIASES = {
+    "opencellid": PROVENANCE_OPENCELLID,
+    "open_cell_id": PROVENANCE_OPENCELLID,
+    "trai": PROVENANCE_TRAI,
+    "trai_india": PROVENANCE_TRAI,
+    "ml": PROVENANCE_ML_SYNTHETIC,
+    "ml_estimate": PROVENANCE_ML_SYNTHETIC,
+    "ml_synthetic": PROVENANCE_ML_SYNTHETIC,
+    "synthetic": PROVENANCE_ML_SYNTHETIC,
+    "hybrid": PROVENANCE_HYBRID,
+    "mixed": PROVENANCE_HYBRID,
+    "mixed_source": PROVENANCE_HYBRID,
+    "opencellid+ml": PROVENANCE_HYBRID,
+    "unknown": PROVENANCE_UNKNOWN,
+}
+
+
+def canonical_provenance(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return PROVENANCE_ALIASES.get(normalized, PROVENANCE_UNKNOWN)
+
+
+def first_percentage(payload: dict[str, Any], *names: str) -> float | None:
+    for name in names:
+        if name not in payload or payload[name] is None:
+            continue
+        try:
+            return max(0.0, min(100.0, float(payload[name])))
+        except (TypeError, ValueError):
+            continue
+    return None
+
 CACHE_TTL_SECONDS = 24 * 60 * 60
 PREDICTION_REFRESH_SECONDS = 30 * 60
 DEFAULT_SUPPORTED_CITIES = "bangalore"
@@ -91,7 +130,7 @@ MAX_TILE_ZOOM = 16
 MVT_LAYER_NAME = "roads"
 MVT_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
 ROAD_FALLBACK_SCORE = 0.05
-OPENCELLID_TOKEN = os.getenv("OPENCELLID_TOKEN", "pk.37dddd741049308fd26c175be7a5aea0")
+OPENCELLID_TOKEN = os.getenv("OPENCELLID_TOKEN", "").strip()
 OPENCELLID_MAX_BBOX_AREA_M2 = 4_000_000.0
 OPENCELLID_CHUNK_SIDE_KM = 1.8
 CORRIDOR_CACHE_TTL = 600
@@ -101,8 +140,8 @@ GRAPH_CACHE_DIR = Path(os.getenv("GRAPH_CACHE_DIR", str(APP_CACHE_DIR / "graphs"
 HOTSPOT_CACHE_PATH = Path(os.getenv("HOTSPOT_CACHE_PATH", str(APP_CACHE_DIR / "hotspots.json")))
 OSMNX_HTTP_CACHE_DIR = Path(os.getenv("OSMNX_HTTP_CACHE_DIR", str(APP_CACHE_DIR / "osmnx-http")))
 OVERPASS_TIMEOUT_SECONDS = int(os.getenv("OSMNX_REQUEST_TIMEOUT", "60"))
-REAL_SCORE_DIR = DATA_DIR / "scores"
-TOWER_DIR = DATA_DIR / "towers"
+REAL_SCORE_DIR = Path(os.getenv("REAL_SCORE_DIR", str(DATA_DIR / "scores")))
+TOWER_DIR = Path(os.getenv("TOWER_DIR", str(DATA_DIR / "towers")))
 TOWER_CACHE_DB_PATH = Path(os.getenv("TOWER_CACHE_DB_PATH", str(DATA_DIR / "tower_cache.db")))
 API_KEY_STATE_PATH = Path(os.getenv("OPENCELLID_KEY_STATE_PATH", str(DATA_DIR / "api_key_state.json")))
 ENV_FILE_PATH = Path(os.getenv("ENV_FILE_PATH", str(SERVICE_DIR / ".env")))
@@ -115,7 +154,10 @@ PRELOAD_GUARD_LOCK = threading.Lock()
 SCHEDULER_STOP = threading.Event()
 SCHEDULER_THREAD: threading.Thread | None = None
 PRELOAD_THREADS: dict[str, threading.Thread] = {}
-CORRIDOR_CACHE: dict[tuple[float, float, float, float], tuple[list[dict[str, Any]], float]] = {}
+CORRIDOR_CACHE: dict[
+    tuple[float, float, float, float],
+    tuple[list[dict[str, Any]], float, bool, str],
+] = {}
 WGS84_TO_WEB_MERCATOR = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 EMPTY_TILE = mapbox_vector_tile.encode({"name": MVT_LAYER_NAME, "features": []})
 ACTIVE_CITY: str | None = None
@@ -163,12 +205,14 @@ class CityState:
     segment_lookup: dict[str, int]
     tile_index: dict[int, dict[int, dict[int, list[int]]]] = field(default_factory=dict)
     edge_tile_map: dict[str, set[tuple[int, int, int]]] = field(default_factory=dict)
+    coverage_tile_edge_map: dict[str, list[int]] = field(default_factory=dict)
     tile_cache: "LRUTileCache" = field(default_factory=lambda: LRUTileCache(maxsize=500))
     context: dict[str, list[float]] = field(default_factory=dict)
     scores_updated_at: float = 0.0
     gpu_spatial_index: Any | None = None
     score_values: Any | None = None
-    score_source: str = "ML_synthetic"
+    score_source: str = PROVENANCE_ML_SYNTHETIC
+    real_score_sources: dict[str, str] = field(default_factory=dict)
     score_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -181,6 +225,7 @@ class CorridorScoresRequest(BaseModel):
 
 class CorridorTileUpdateRequest(BaseModel):
     scores: dict[str, float]
+    edge_sources: dict[str, str] | None = None
 
 
 class LRUTileCache:
@@ -446,7 +491,7 @@ def score_summary(values: np.ndarray) -> dict[str, float]:
         "dead": dead,
         "weak": weak,
         "good": good,
-        "coverage_percent": round((good / total) * 100.0, 1),
+        "good_signal_percent": round((good / total) * 100.0, 1),
         "dead_zone_percent": round((dead / total) * 100.0, 1),
     }
 
@@ -457,8 +502,11 @@ def default_score_metadata(city: str, source: str, *, updated_at: float = 0.0) -
         timestamp = time.strftime("%Y-%m-%d", time.gmtime(updated_at))
     return {
         "city": city,
-        "source": source,
+        "source": canonical_provenance(source),
         "tower_count": 0,
+        "real_data_coverage_percent": 0.0,
+        "good_signal_percent": 0.0,
+        # Compatibility alias. It always means real-data coverage, never signal quality.
         "coverage_percent": 0.0,
         "dead_zone_percent": 0.0,
         "last_updated": timestamp,
@@ -485,33 +533,157 @@ def load_real_scores(city: str, state: CityState) -> tuple[np.ndarray, dict[str,
         score_values[segment_index] = np.float32(max(0.0, min(1.0, float(score))))
         matched += 1
 
-    metadata = load_json_file(real_scores_meta_path(city))
-    if not metadata:
-        metadata = load_json_file(tower_meta_path(city))
+    raw_metadata = load_json_file(real_scores_meta_path(city))
+    if not raw_metadata:
+        raw_metadata = load_json_file(tower_meta_path(city))
     metadata = {
-        **default_score_metadata(city, "OpenCellID"),
-        **metadata,
+        **default_score_metadata(city, PROVENANCE_UNKNOWN),
+        **raw_metadata,
         "city": city,
         "matched_segments": matched,
     }
 
     summary = score_summary(score_values)
-    metadata["coverage_percent"] = float(metadata.get("coverage_percent") or summary["coverage_percent"])
-    metadata["dead_zone_percent"] = float(metadata.get("dead_zone_percent") or summary["dead_zone_percent"])
+    real_source = canonical_provenance(
+        raw_metadata.get("real_data_source") or raw_metadata.get("source")
+    )
+    real_coverage = first_percentage(raw_metadata, "real_data_coverage_percent")
+    if real_coverage is None and real_source == PROVENANCE_TRAI:
+        real_coverage = first_percentage(raw_metadata, "coverage_percent")
+    if real_coverage is None:
+        observed = int(np.sum(score_values > (ROAD_FALLBACK_SCORE + 1e-6)))
+        real_coverage = round(
+            (observed / max(len(state.segments), 1)) * 100.0,
+            1,
+        )
+    if real_coverage <= 0.0:
+        aggregate_source = PROVENANCE_ML_SYNTHETIC
+    elif real_coverage < 100.0:
+        aggregate_source = PROVENANCE_HYBRID
+    else:
+        aggregate_source = real_source
+    metadata["real_data_source"] = real_source
+    metadata["source"] = aggregate_source
+    metadata["real_data_coverage_percent"] = real_coverage
+    metadata["coverage_percent"] = real_coverage
+    metadata["good_signal_percent"] = summary["good_signal_percent"]
+    metadata["dead_zone_percent"] = float(
+        metadata.get("dead_zone_percent") or summary["dead_zone_percent"]
+    )
     metadata.setdefault("tower_count", 0)
 
     print(f"[scores] Loaded REAL TRAI/tower scores for {city}")
     print("[scores] Score distribution:")
     print(f"  Dead zones: {summary['dead']} ({summary['dead_zone_percent']:.1f}%)")
-    print(f"  Weak signal: {summary['weak']} ({(summary['weak'] / max(len(score_values), 1)) * 100.0:.1f}%)")
-    print(f"  Good signal: {summary['good']} ({summary['coverage_percent']:.1f}%)")
+    print(
+        f"  Weak signal: {summary['weak']} "
+        f"({(summary['weak'] / max(len(score_values), 1)) * 100.0:.1f}%)"
+    )
+    print(f"  Good signal: {summary['good']} ({summary['good_signal_percent']:.1f}%)")
     return score_values, metadata
+
+
+def merge_real_score_source(state: CityState, segment_id: str, source: Any) -> None:
+    """Record a real observation without inventing a provider for mixed inputs."""
+    canonical_source = canonical_provenance(source)
+    if canonical_source in {PROVENANCE_ML_SYNTHETIC, PROVENANCE_HYBRID}:
+        canonical_source = PROVENANCE_UNKNOWN
+    previous_source = state.real_score_sources.get(segment_id)
+    if previous_source is None:
+        state.real_score_sources[segment_id] = canonical_source
+    elif previous_source != canonical_source:
+        state.real_score_sources[segment_id] = PROVENANCE_UNKNOWN
+
+
+def score_provenance_summary(state: CityState) -> tuple[str, str, float]:
+    real_sources = [
+        canonical_provenance(state.real_score_sources[segment_id])
+        for segment_id in state.segment_lookup
+        if segment_id in state.real_score_sources
+    ]
+    real_count = len(real_sources)
+    total_count = len(state.segments)
+    real_coverage = round((real_count / max(total_count, 1)) * 100.0, 1)
+    known_sources = {
+        source
+        for source in real_sources
+        if source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+    }
+    all_sources_known = bool(real_sources) and all(
+        source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        for source in real_sources
+    )
+    real_source = (
+        next(iter(known_sources))
+        if all_sources_known and len(known_sources) == 1
+        else PROVENANCE_UNKNOWN
+    )
+    if real_count == 0:
+        aggregate_source = PROVENANCE_ML_SYNTHETIC
+    elif real_count < total_count:
+        aggregate_source = PROVENANCE_HYBRID
+    else:
+        aggregate_source = real_source
+    return aggregate_source, real_source, real_coverage
+
+
+def edge_score_provenance(state: CityState, segment_id: str) -> str:
+    if segment_id not in state.real_score_sources:
+        return PROVENANCE_ML_SYNTHETIC
+    source = canonical_provenance(state.real_score_sources[segment_id])
+    return PROVENANCE_UNKNOWN if source == PROVENANCE_HYBRID else source
+
+
+def refresh_score_metadata(
+    city: str,
+    state: CityState,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    incoming = dict(metadata or {})
+    incoming_source = canonical_provenance(incoming.get("source"))
+    if incoming_source == PROVENANCE_ML_SYNTHETIC and state.real_score_sources:
+        for protected_name in (
+            "tower_count",
+            "real_data_source",
+            "real_data_coverage_percent",
+            "coverage_percent",
+            "covered_tiles",
+            "total_tiles",
+        ):
+            incoming.pop(protected_name, None)
+
+    aggregate_source, real_source, real_coverage = score_provenance_summary(state)
+    score_values = (
+        to_numpy_array(state.score_values).astype(np.float32, copy=False)
+        if state.score_values is not None
+        else np.full(len(state.segments), 0.5, dtype=np.float32)
+    )
+    summary = score_summary(score_values)
+    state.score_source = aggregate_source
+    state.score_metadata = {
+        **default_score_metadata(city, aggregate_source, updated_at=state.scores_updated_at),
+        **state.score_metadata,
+        **incoming,
+        "city": city,
+        "source": aggregate_source,
+        "provenance_source": aggregate_source,
+        "real_data_source": real_source,
+        "real_data_coverage_percent": real_coverage,
+        "coverage_percent": real_coverage,
+        "good_signal_percent": summary["good_signal_percent"],
+        "dead_zone_percent": summary["dead_zone_percent"],
+    }
+    if not state.score_metadata.get("last_updated") and state.scores_updated_at:
+        state.score_metadata["last_updated"] = time.strftime(
+            "%Y-%m-%d", time.gmtime(state.scores_updated_at)
+        )
 
 
 def cached_coverage_metadata(city: str) -> dict[str, Any] | None:
     city_slug = normalize_city(city)
     if not TOWER_CACHE_DB_PATH.exists():
         return None
+    fresh_cutoff = int(time.time() - TILE_STALE_SECONDS)
     try:
         with sqlite3.connect(str(TOWER_CACHE_DB_PATH), timeout=1, check_same_thread=False) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
@@ -524,10 +696,28 @@ def cached_coverage_metadata(city: str) -> dict[str, Any] | None:
             )
             covered_tiles = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM coverage_tiles WHERE city = ? AND has_real_data = 1",
-                    (city_slug,),
+                    """
+                    SELECT COUNT(*)
+                    FROM coverage_tiles AS coverage
+                    JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
+                    WHERE coverage.city = ? AND coverage.has_real_data = 1
+                      AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
+                      AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
+                    """,
+                    (city_slug, fresh_cutoff),
                 ).fetchone()[0]
             )
+            source_rows = conn.execute(
+                """
+                SELECT DISTINCT coverage.source
+                FROM coverage_tiles AS coverage
+                JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
+                WHERE coverage.city = ? AND coverage.has_real_data = 1
+                  AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
+                  AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
+                """,
+                (city_slug, fresh_cutoff),
+            ).fetchall()
             if total_tiles <= 0 or covered_tiles <= 0:
                 return None
             tower_count = int(
@@ -535,34 +725,43 @@ def cached_coverage_metadata(city: str) -> dict[str, Any] | None:
                     """
                     SELECT COUNT(DISTINCT tw.id)
                     FROM towers AS tw
-                    JOIN tower_tile_map AS map
-                      ON map.tower_id = tw.id
-                    JOIN tiles AS t
-                      ON t.tile_id = map.tile_id
-                    WHERE t.city = ?
+                    JOIN tower_tile_map AS map ON map.tower_id = tw.id
+                    JOIN tiles AS t ON t.tile_id = map.tile_id
+                    JOIN coverage_tiles AS coverage ON coverage.tile_id = t.tile_id
+                    WHERE t.city = ? AND coverage.has_real_data = 1
+                      AND t.is_cached = 1 AND t.last_updated IS NOT NULL
+                      AND CAST(strftime('%s', t.last_updated) AS INTEGER) >= ?
                     """,
-                    (city_slug,),
+                    (city_slug, fresh_cutoff),
                 ).fetchone()[0]
             )
             last_updated = conn.execute(
                 """
-                SELECT MAX(last_updated)
-                FROM tiles
-                WHERE city = ? AND is_cached = 1
+                SELECT MAX(last_updated) FROM tiles
+                WHERE city = ? AND is_cached = 1 AND last_updated IS NOT NULL
+                  AND CAST(strftime('%s', last_updated) AS INTEGER) >= ?
                 """,
-                (city_slug,),
+                (city_slug, fresh_cutoff),
             ).fetchone()[0]
-    except sqlite3.OperationalError as exc:
-        print(f"[coverage-debug] metadata query busy: {exc}")
+    except sqlite3.Error as exc:
+        print(f"[coverage] metadata query unavailable: {exc}")
         return None
 
-    coverage_percent = round((covered_tiles / max(total_tiles, 1)) * 100.0, 1)
-    print(f"[coverage-debug] covered tiles: {covered_tiles}")
-    print(f"[coverage-debug] total tiles: {total_tiles}")
+    real_coverage = round((covered_tiles / max(total_tiles, 1)) * 100.0, 1)
+    stored_sources = {canonical_provenance(row[0]) for row in source_rows}
+    real_source = (
+        next(iter(stored_sources))
+        if len(stored_sources) == 1
+        and stored_sources <= {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        else PROVENANCE_UNKNOWN
+    )
     return {
-        "source": "OpenCellID",
+        "source": PROVENANCE_HYBRID if real_coverage < 100.0 else real_source,
+        "real_data_source": real_source,
         "tower_count": tower_count,
-        "coverage_percent": coverage_percent,
+        "real_data_coverage_percent": real_coverage,
+        "coverage_percent": real_coverage,
+        "good_signal_percent": 0.0,
         "dead_zone_percent": 0.0,
         "last_updated": last_updated or "",
         "covered_tiles": covered_tiles,
@@ -678,23 +877,14 @@ async def fetch_tower_chunk(
 ) -> list[dict[str, Any]]:
     from tile_loader import fetch_tower_chunk as fetch_tower_chunk_impl
 
-    while True:
-        try:
-            return await fetch_tower_chunk_impl(
-                client,
-                chunk_bbox,
-                chunk_number=chunk_number,
-                key_manager=API_KEY_MANAGER,
-                token=OPENCELLID_TOKEN,
-                logger=print,
-            )
-        except RuntimeError as exc:
-            message = str(exc).lower()
-            if API_KEY_MANAGER is not None and "daily limit" in message:
-                print("[api-key] exception quota hit - rotating key")
-                API_KEY_MANAGER.mark_exhausted(reason=str(exc))
-                continue
-            raise
+    return await fetch_tower_chunk_impl(
+        client,
+        chunk_bbox,
+        chunk_number=chunk_number,
+        key_manager=API_KEY_MANAGER,
+        token=OPENCELLID_TOKEN,
+        logger=print,
+    )
 
 
 async def fetch_towers_for_corridor(
@@ -738,7 +928,7 @@ async def fetch_towers_for_corridor(
             logger=print,
         )
     except Exception as exc:
-        print(f"[towers] fetch error: {type(exc).__name__}: {exc!s}")
+        print(f"[towers] fetch error: {type(exc).__name__}; using fallback")
         return None
 
     if not towers:
@@ -777,10 +967,10 @@ async def fetch_towers_cached(
     city_slug = default_city()
     cached = CORRIDOR_CACHE.get(key)
     if cached is not None:
-        towers, cached_at = cached
+        towers, cached_at, cached_live_full_bbox, cached_live_source = cached
         if now - cached_at < CORRIDOR_CACHE_TTL:
             print(f"[towers] cache hit for bbox {key} ({len(towers)} towers)")
-            _cached_towers, _missing_tile_ids, covered_tile_ids, query_tiles = cached_towers_for_bbox(
+            _, missing_tile_ids, covered_tile_ids, query_tiles = cached_towers_for_bbox(
                 TOWER_CACHE_DB_PATH,
                 city_slug,
                 min_lat,
@@ -788,24 +978,20 @@ async def fetch_towers_cached(
                 max_lat,
                 max_lon,
             )
-            coverage_percent = round((len(covered_tile_ids) / max(len(query_tiles), 1)) * 100.0, 1) if query_tiles else 0.0
-            source = "OpenCellID" if (coverage_percent > 0.0 or bool(towers)) else "ML estimate"
-            print(f"[coverage] percent: {coverage_percent}")
-            print(f"[coverage-debug] covered tiles: {len(covered_tile_ids)}")
-            print(f"[coverage-debug] total tiles: {len(query_tiles)}")
+            metadata = corridor_coverage_metadata(
+                towers,
+                missing_tile_ids,
+                covered_tile_ids,
+                query_tiles,
+                live_full_bbox=cached_live_full_bbox,
+                live_source=cached_live_source,
+            )
             return towers, {
                 "min_lat": key[0],
                 "min_lon": key[1],
                 "max_lat": key[2],
                 "max_lon": key[3],
-            }, {
-                "source": source,
-                "covered_tile_ids": covered_tile_ids,
-                "query_tiles": query_tiles,
-                "total_tiles": len(query_tiles),
-                "covered_tiles": len(covered_tile_ids),
-                "coverage_percent": coverage_percent,
-            }
+            }, metadata
         CORRIDOR_CACHE.pop(key, None)
         print(f"[towers] cache expired for bbox {key}")
 
@@ -817,29 +1003,22 @@ async def fetch_towers_cached(
         max_lat,
         max_lon,
     )
-    coverage_percent = round((len(covered_tile_ids) / max(len(query_tiles), 1)) * 100.0, 1) if query_tiles else 0.0
-    metadata: dict[str, Any] = {
-        "source": "OpenCellID" if (coverage_percent > 0.0 or bool(towers)) else "ML estimate",
-        "covered_tile_ids": covered_tile_ids,
-        "query_tiles": query_tiles,
-        "total_tiles": len(query_tiles),
-        "covered_tiles": len(covered_tile_ids),
-        "coverage_percent": coverage_percent,
-    }
-    print(f"[coverage] percent: {coverage_percent}")
-    print(f"[coverage-debug] covered tiles: {len(covered_tile_ids)}")
-    print(f"[coverage-debug] total tiles: {len(query_tiles)}")
+    metadata = corridor_coverage_metadata(
+        towers,
+        missing_tile_ids,
+        covered_tile_ids,
+        query_tiles,
+    )
     if towers:
         print(f"[tower-cache] hit for bbox {key} ({len(towers)} towers)")
-        CORRIDOR_CACHE[key] = (towers, now)
     else:
         print(f"[tower-cache] miss for bbox {key}")
 
     if missing_tile_ids:
         queued = queue_missing_tower_tiles(missing_tile_ids)
         print(f"[tower-cache] queued {queued} missing tile(s) for bbox {key}")
-        if not towers or coverage_percent > 0.0:
-            print(f"[tower-cache] no persisted towers available for bbox {key}; using live corridor fetch")
+        if not towers and live_tower_fetch_available():
+            print(f"[tower-cache] no persisted towers available for bbox {key}; trying local/live corridor source")
             towers = await fetch_towers_for_corridor(
                 origin_lat,
                 origin_lon,
@@ -848,8 +1027,16 @@ async def fetch_towers_cached(
                 padding_km,
             )
             if towers:
-                CORRIDOR_CACHE[key] = (towers, now)
-                metadata["source"] = "OpenCellID"
+                live_source = tower_provenance_source()
+                CORRIDOR_CACHE[key] = (towers, now, True, live_source)
+                metadata = corridor_coverage_metadata(
+                    towers,
+                    [],
+                    set(),
+                    query_tiles,
+                    live_full_bbox=True,
+                    live_source=live_source,
+                )
 
     return towers or None, {
         "min_lat": key[0],
@@ -857,6 +1044,84 @@ async def fetch_towers_cached(
         "max_lat": key[2],
         "max_lon": key[3],
     }, metadata
+
+
+def tower_provenance_source() -> str:
+    local_status = local_tower_source_status()
+    if local_status.get("loaded") and int(local_status.get("count") or 0) > 0:
+        return canonical_provenance(local_status.get("source"))
+    if OPENCELLID_TOKEN:
+        return PROVENANCE_OPENCELLID
+    if API_KEY_MANAGER is not None and int(API_KEY_MANAGER.status().get("total_keys") or 0) > 0:
+        return PROVENANCE_OPENCELLID
+    return PROVENANCE_UNKNOWN
+
+
+def live_tower_fetch_available() -> bool:
+    local_status = local_tower_source_status()
+    if local_status.get("loaded") and int(local_status.get("count") or 0) > 0:
+        return True
+    if OPENCELLID_TOKEN:
+        return True
+    if API_KEY_MANAGER is None:
+        return False
+    status = API_KEY_MANAGER.status()
+    return int(status.get("remaining_keys") or 0) > 0
+
+
+def corridor_coverage_metadata(
+    towers: list[dict[str, Any]],
+    missing_tile_ids: list[str],
+    covered_tile_ids: set[str],
+    query_tiles: list[Any],
+    *,
+    live_full_bbox: bool = False,
+    live_source: str | None = None,
+) -> dict[str, Any]:
+    if live_full_bbox and towers:
+        real_coverage = 100.0
+    else:
+        real_coverage = round(
+            (len(covered_tile_ids) / max(len(query_tiles), 1)) * 100.0,
+            1,
+        ) if query_tiles else 0.0
+    tile_sources = coverage_sources_for_tiles(TOWER_CACHE_DB_PATH, covered_tile_ids)
+    stored_sources = {
+        canonical_provenance(tile_sources.get(tile_id))
+        for tile_id in covered_tile_ids
+    }
+    if live_full_bbox:
+        real_source = (
+            tower_provenance_source()
+            if live_source is None
+            else canonical_provenance(live_source)
+        )
+    elif (
+        len(stored_sources) == 1
+        and stored_sources <= {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+    ):
+        real_source = next(iter(stored_sources))
+    else:
+        real_source = PROVENANCE_UNKNOWN
+    if real_coverage <= 0.0:
+        aggregate_source = PROVENANCE_UNKNOWN
+    elif real_coverage < 100.0:
+        aggregate_source = PROVENANCE_HYBRID
+    else:
+        aggregate_source = real_source
+    return {
+        "source": aggregate_source,
+        "real_data_source": real_source,
+        "tile_sources": tile_sources,
+        "covered_tile_ids": covered_tile_ids,
+        "missing_tile_ids": missing_tile_ids,
+        "query_tiles": query_tiles,
+        "total_tiles": len(query_tiles),
+        "covered_tiles": len(covered_tile_ids),
+        "real_data_coverage_percent": real_coverage,
+        "coverage_percent": real_coverage,
+        "live_full_bbox": live_full_bbox,
+    }
 
 
 def tile_contains_point(tile: Any, lat: float, lon: float) -> bool:
@@ -870,64 +1135,188 @@ def corridor_real_edge_coords(
     edge_coords: dict[str, list[float] | tuple[float, float]],
     query_tiles: list[Any],
     covered_tile_ids: set[str],
-) -> dict[str, tuple[float, float]]:
-    if not edge_coords:
-        return {}
-    if not query_tiles or not covered_tile_ids:
-        return {}
-
+    tile_sources: dict[str, str] | None = None,
+) -> tuple[dict[str, tuple[float, float]], dict[str, str]]:
     real_edges: dict[str, tuple[float, float]] = {}
+    edge_sources: dict[str, str] = {}
+    source_by_tile = tile_sources or {}
     for edge_id, coords in edge_coords.items():
         lat = float(coords[0])
         lon = float(coords[1])
-        for tile in query_tiles:
-            if tile.tile_id in covered_tile_ids and tile_contains_point(tile, lat, lon):
-                real_edges[str(edge_id)] = (lat, lon)
-                break
-    return real_edges
+        matching_tiles = [
+            tile
+            for tile in query_tiles
+            if tile.tile_id in covered_tile_ids and tile_contains_point(tile, lat, lon)
+        ]
+        if not matching_tiles:
+            continue
+        segment_id = str(edge_id)
+        real_edges[segment_id] = (lat, lon)
+        sources = {
+            canonical_provenance(source_by_tile.get(tile.tile_id))
+            for tile in matching_tiles
+        }
+        known_sources = sources & {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        edge_sources[segment_id] = (
+            next(iter(known_sources))
+            if len(known_sources) == 1 and sources == known_sources
+            else PROVENANCE_UNKNOWN
+        )
+    return real_edges, edge_sources
+
+
+def coverage_scores_for_tile(
+    city: str,
+    state: CityState,
+    tile_id: str,
+) -> tuple[dict[str, float], dict[str, str]]:
+    city_slug = normalize_city(city)
+    tile = cached_tile_bounds(TOWER_CACHE_DB_PATH, tile_id)
+    if tile is None:
+        return {}, {}
+
+    tile_polygon = box(tile.min_lon, tile.min_lat, tile.max_lon, tile.max_lat)
+    candidate_indexes = state.coverage_tile_edge_map.get(tile_id)
+    if candidate_indexes is None:
+        candidate_indexes = list(range(len(state.segments)))
+    affected_segments = [
+        state.segments[segment_index]
+        for segment_index in candidate_indexes
+        if 0 <= segment_index < len(state.segments)
+        and state.segments[segment_index].geometry.intersects(tile_polygon)
+    ]
+    if not affected_segments:
+        return {}, {}
+
+    min_lon = min(segment.geometry.bounds[0] for segment in affected_segments)
+    min_lat = min(segment.geometry.bounds[1] for segment in affected_segments)
+    max_lon = max(segment.geometry.bounds[2] for segment in affected_segments)
+    max_lat = max(segment.geometry.bounds[3] for segment in affected_segments)
+    latitude_padding = 2_000.0 / 111_000.0
+    longitude_padding = latitude_padding / max(
+        math.cos(math.radians((min_lat + max_lat) / 2.0)),
+        0.2,
+    )
+    towers, _missing_tiles, covered_tile_ids, query_tiles = cached_towers_for_bbox(
+        TOWER_CACHE_DB_PATH,
+        city_slug,
+        min_lat - latitude_padding,
+        min_lon - longitude_padding,
+        max_lat + latitude_padding,
+        max_lon + longitude_padding,
+        ensure_tiles=False,
+    )
+    tile_sources = coverage_sources_for_tiles(
+        TOWER_CACHE_DB_PATH,
+        covered_tile_ids,
+        ensure_database=False,
+    )
+    edge_coords: dict[str, tuple[float, float]] = {}
+    edge_sources: dict[str, str] = {}
+    for segment in affected_segments:
+        matching_tile_ids = {
+            query_tile.tile_id
+            for query_tile in query_tiles
+            if query_tile.tile_id in covered_tile_ids
+            and segment.geometry.intersects(
+                box(
+                    query_tile.min_lon,
+                    query_tile.min_lat,
+                    query_tile.max_lon,
+                    query_tile.max_lat,
+                )
+            )
+        }
+        if not matching_tile_ids:
+            continue
+        edge_coords[segment.segment_id] = (segment.lat, segment.lon)
+        matching_sources = {
+            canonical_provenance(tile_sources.get(matching_tile_id))
+            for matching_tile_id in matching_tile_ids
+        }
+        known_sources = {
+            source
+            for source in matching_sources
+            if source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        }
+        edge_sources[segment.segment_id] = (
+            next(iter(known_sources))
+            if len(known_sources) == 1
+            and all(source in known_sources for source in matching_sources)
+            else PROVENANCE_UNKNOWN
+        )
+    if not edge_coords:
+        return {}, {}
+
+    scores = (
+        compute_scores_from_towers(edge_coords, towers)
+        if towers
+        else {edge_id: ROAD_FALLBACK_SCORE for edge_id in edge_coords}
+    )
+    return scores, edge_sources
 
 
 def update_coverage_model(city: str, tile_id: str, tower_count: int) -> None:
+    CORRIDOR_CACHE.clear()
     city_slug = normalize_city(city)
     state = GRAPH_CACHE.get(city_slug)
-    tile = cached_tile_bounds(TOWER_CACHE_DB_PATH, tile_id)
-    if state is None or tile is None:
+    if state is None:
         return
 
-    towers, _missing_tiles, _covered_tile_ids, _query_tiles = cached_towers_for_bbox(
-        TOWER_CACHE_DB_PATH,
-        city_slug,
-        tile.min_lat,
-        tile.min_lon,
-        tile.max_lat,
-        tile.max_lon,
-    )
-    if not towers:
-        return
-
-    tile_polygon = box(tile.min_lon, tile.min_lat, tile.max_lon, tile.max_lat)
-    edge_coords: dict[str, tuple[float, float]] = {}
-    for segment in state.segments:
-        if segment.geometry.intersects(tile_polygon):
-            edge_coords[segment.segment_id] = (segment.lat, segment.lon)
-    if not edge_coords:
-        return
-
-    scores = compute_scores_from_towers(edge_coords, towers)
+    scores, edge_sources = coverage_scores_for_tile(city_slug, state, tile_id)
     if not scores:
         return
+
+    coverage_metadata = cached_coverage_metadata(city_slug) or {}
 
     apply_city_scores(
         city_slug,
         state,
         scores,
         {
-            "source": "OpenCellID",
-            "tower_count": tower_count,
+            **coverage_metadata,
+            "source": coverage_metadata.get("source") or tower_provenance_source(),
+            "tower_count": int(coverage_metadata.get("tower_count") or tower_count),
             "last_updated": time.strftime("%Y-%m-%d", time.gmtime()),
         },
+        edge_sources=edge_sources,
     )
     print(f"[adaptive] updated {len(scores)} segment scores from tile {tile_id}")
+
+
+def hydrate_cached_coverage(city: str, state: CityState) -> int:
+    tile_ids = fresh_covered_tile_ids(TOWER_CACHE_DB_PATH, city)
+    if not tile_ids:
+        return 0
+
+    merged_scores: dict[str, float] = {}
+    merged_sources: dict[str, str] = {}
+    for tile_id in tile_ids:
+        tile_scores, tile_sources = coverage_scores_for_tile(city, state, tile_id)
+        merged_scores.update(tile_scores)
+        for segment_id, source in tile_sources.items():
+            canonical_source = canonical_provenance(source)
+            previous_source = merged_sources.get(segment_id)
+            merged_sources[segment_id] = (
+                canonical_source
+                if previous_source is None or previous_source == canonical_source
+                else PROVENANCE_UNKNOWN
+            )
+
+    if not merged_scores:
+        return 0
+    apply_city_scores(
+        city,
+        state,
+        merged_scores,
+        cached_coverage_metadata(city) or {},
+        edge_sources=merged_sources,
+    )
+    print(
+        f"[adaptive] restored {len(merged_scores)} edge scores "
+        f"from {len(tile_ids)} fresh coverage tiles"
+    )
+    return len(merged_scores)
 
 
 def compute_scores_from_towers(
@@ -1260,6 +1649,7 @@ def build_segments(
     dict[str, int],
     dict[int, dict[int, dict[int, list[int]]]],
     dict[str, set[tuple[int, int, int]]],
+    dict[str, list[int]],
     dict[int, int],
 ]:
     city_slug = normalize_city(city)
@@ -1267,6 +1657,7 @@ def build_segments(
     segment_lookup: dict[str, int] = {}
     tile_index: dict[int, dict[int, dict[int, list[int]]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     edge_tile_map: dict[str, set[tuple[int, int, int]]] = defaultdict(set)
+    coverage_tile_edge_map: dict[str, list[int]] = defaultdict(list)
     zoom_tile_counts: dict[int, set[tuple[int, int]]] = defaultdict(set)
 
     for u, v, key, data in graph.edges(keys=True, data=True):
@@ -1302,6 +1693,14 @@ def build_segments(
         segment_lookup[segment_id] = segment_index
 
         min_lon, min_lat, max_lon, max_lat = geometry.bounds
+        for coverage_tile_id in coverage_tile_ids_for_bbox(
+            city_slug,
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+        ):
+            coverage_tile_edge_map[coverage_tile_id].append(segment_index)
         for tile in mercantile.tiles(
             min_lon,
             min_lat,
@@ -1317,7 +1716,14 @@ def build_segments(
         zoom: len(tile_keys)
         for zoom, tile_keys in zoom_tile_counts.items()
     }
-    return segments, segment_lookup, dict(tile_index), dict(edge_tile_map), tile_count_summary
+    return (
+        segments,
+        segment_lookup,
+        dict(tile_index),
+        dict(edge_tile_map),
+        dict(coverage_tile_edge_map),
+        tile_count_summary,
+    )
 
 
 def derive_city_context(graph) -> dict[str, list[float]]:
@@ -1475,16 +1881,32 @@ def load_city_state(city: str) -> CityState:
         GRAPH_CACHE[city_slug] = state
         ACTIVE_CITY = city_slug
 
+    try:
+        hydrate_cached_coverage(city_slug, state)
+    except Exception as exc:
+        print(
+            f"[adaptive] cached coverage restore skipped ({type(exc).__name__})"
+        )
     refresh_city_predictions(city_slug)
     return GRAPH_CACHE[city_slug]
+
+
+def city_is_ready(city: str) -> bool:
+    city_slug = normalize_city(city)
+    state = GRAPH_CACHE.get(city_slug)
+    return bool(
+        GRAPH_STATUS.get(city_slug) == "ready"
+        and state is not None
+        and state.expires_at > time.time()
+        and state.segments
+    )
 
 
 def require_city_state(city: str) -> CityState:
     city_slug = normalize_city(city)
     cached_state = GRAPH_CACHE.get(city_slug)
-    now = time.time()
 
-    if cached_state and cached_state.expires_at > now and GRAPH_STATUS.get(city_slug) == "ready":
+    if city_is_ready(city_slug) and cached_state is not None:
         return cached_state
 
     status = GRAPH_STATUS.get(city_slug, "idle")
@@ -1524,8 +1946,8 @@ def post_prediction_scores(city: str, state: CityState) -> tuple[dict[str, float
         data = json.loads(response.read().decode("utf-8"))
     raw_scores = data.get("scores", {})
     metadata = {
-        **default_score_metadata(city, "ML_synthetic", updated_at=time.time()),
-        "source": "ML_synthetic",
+        **default_score_metadata(city, PROVENANCE_ML_SYNTHETIC, updated_at=time.time()),
+        "source": PROVENANCE_ML_SYNTHETIC,
         "data_source": str(data.get("data_source") or "synthetic"),
         "confidence": float(data.get("confidence") or 0.0),
     }
@@ -1537,82 +1959,107 @@ def apply_city_scores(
     state: CityState,
     scores: dict[str, float],
     metadata: dict[str, Any] | None = None,
+    edge_sources: dict[str, str] | None = None,
 ) -> None:
-    changed = False
-    current_scores = (
-        to_numpy_array(state.score_values).astype(np.float32, copy=True)
-        if state.score_values is not None
-        else np.full(len(state.segments), 0.5, dtype=np.float32)
-    )
+    city_slug = normalize_city(city)
+    incoming_source = canonical_provenance((metadata or {}).get("source"))
+    prediction_update = incoming_source == PROVENANCE_ML_SYNTHETIC
+    provided_edge_sources = edge_sources or {}
 
-    for segment_id, score in scores.items():
-        rounded_score = max(0.0, min(1.0, round(float(score), 3)))
-        segment_index = state.segment_lookup.get(segment_id)
-        if segment_index is None:
-            continue
-        if not math.isclose(float(current_scores[segment_index]), rounded_score, abs_tol=1e-4):
-            current_scores[segment_index] = rounded_score
-            changed = True
+    with CITY_LOCKS[city_slug]:
+        changed = False
+        provenance_changed = False
+        current_scores = (
+            to_numpy_array(state.score_values).astype(np.float32, copy=True)
+            if state.score_values is not None
+            else np.full(len(state.segments), 0.5, dtype=np.float32)
+        )
 
-    state.score_values = to_device_array(current_scores)
-    state.scores_updated_at = time.time()
-    state.score_source = str((metadata or {}).get("source") or state.score_source or "ML_synthetic")
-    state.score_metadata = {
-        **default_score_metadata(city, state.score_source, updated_at=state.scores_updated_at),
-        **state.score_metadata,
-        **(metadata or {}),
-    }
-    summary = score_summary(current_scores)
-    if state.score_source in {"OpenCellID", "OpenCelliD", "TRAI"}:
-        state.score_metadata["coverage_percent"] = float(
-            state.score_metadata.get("coverage_percent") or summary["coverage_percent"]
-        )
-        state.score_metadata["dead_zone_percent"] = float(
-            state.score_metadata.get("dead_zone_percent") or summary["dead_zone_percent"]
-        )
-    else:
-        state.score_metadata["coverage_percent"] = summary["coverage_percent"]
-        state.score_metadata["dead_zone_percent"] = summary["dead_zone_percent"]
-    state.score_metadata["last_updated"] = time.strftime("%Y-%m-%d", time.gmtime(state.scores_updated_at))
-    if changed:
-        state.tile_cache.clear()
+        for raw_segment_id, score in scores.items():
+            segment_id = str(raw_segment_id)
+            segment_index = state.segment_lookup.get(segment_id)
+            if segment_index is None:
+                continue
+            if prediction_update and segment_id in state.real_score_sources:
+                continue
+
+            rounded_score = max(0.0, min(1.0, round(float(score), 3)))
+            if not math.isclose(float(current_scores[segment_index]), rounded_score, abs_tol=1e-4):
+                current_scores[segment_index] = rounded_score
+                changed = True
+
+            if segment_id in provided_edge_sources:
+                previous_source = state.real_score_sources.get(segment_id)
+                provided_source = canonical_provenance(provided_edge_sources[segment_id])
+                if provided_source != PROVENANCE_ML_SYNTHETIC:
+                    # Per-edge sources describe the complete set of fresh tile
+                    # observations used for this score, so they supersede any
+                    # provenance retained from an earlier tile refresh.
+                    if provided_source == PROVENANCE_HYBRID:
+                        provided_source = PROVENANCE_UNKNOWN
+                    state.real_score_sources[segment_id] = provided_source
+                provenance_changed = (
+                    provenance_changed
+                    or state.real_score_sources.get(segment_id) != previous_source
+                )
+            elif incoming_source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}:
+                previous_source = state.real_score_sources.get(segment_id)
+                merge_real_score_source(state, segment_id, incoming_source)
+                provenance_changed = (
+                    provenance_changed
+                    or state.real_score_sources.get(segment_id) != previous_source
+                )
+
+        state.score_values = to_device_array(current_scores)
+        state.scores_updated_at = time.time()
+        refresh_score_metadata(city_slug, state, metadata)
+        if changed or provenance_changed:
+            state.tile_cache.clear()
+            with HOTSPOT_CACHE_LOCK:
+                HOTSPOT_CACHE.clear()
     free_gpu_memory()
 
 
-def update_corridor_tiles(city: str, scores: dict[str, float]) -> int:
+def update_corridor_tiles(
+    city: str,
+    scores: dict[str, float],
+    edge_sources: dict[str, str] | None = None,
+) -> int:
     city_slug = normalize_city(city)
     state = GRAPH_CACHE.get(city_slug)
     if state is None or not scores:
         return 0
 
-    current_scores = (
-        to_numpy_array(state.score_values).astype(np.float32, copy=True)
-        if state.score_values is not None
-        else np.full(len(state.segments), 0.5, dtype=np.float32)
+    valid_scores = {
+        str(edge_id): score
+        for edge_id, score in scores.items()
+        if str(edge_id) in state.segment_lookup
+    }
+    if not valid_scores:
+        return 0
+    supplied_sources = edge_sources or {}
+    valid_sources = {
+        edge_id: str(supplied_sources.get(edge_id) or PROVENANCE_UNKNOWN)
+        for edge_id in valid_scores
+    }
+    coverage_metadata = cached_coverage_metadata(city_slug) or {}
+    apply_city_scores(
+        city_slug,
+        state,
+        valid_scores,
+        coverage_metadata,
+        edge_sources=valid_sources,
     )
-
-    invalidated: set[tuple[int, int, int]] = set()
-    updated = 0
-    for edge_id, score in scores.items():
-        segment_index = state.segment_lookup.get(str(edge_id))
-        if segment_index is None:
-            continue
-        clamped = np.float32(max(0.0, min(1.0, float(score))))
-        current_scores[segment_index] = clamped
-        updated += 1
-        for tile_key in state.edge_tile_map.get(str(edge_id), set()):
-            invalidated.add(tile_key)
-
-    state.score_values = to_device_array(current_scores)
-    for tile_key in invalidated:
-        state.tile_cache.cache.pop(tile_key, None)
-
-    if updated:
-        state.scores_updated_at = time.time()
-        print(f"[tiles] invalidated corridor tiles with real scores ({len(invalidated)} tiles)")
-
-    free_gpu_memory()
-    return updated
+    invalidated = {
+        tile_key
+        for edge_id in valid_scores
+        for tile_key in state.edge_tile_map.get(edge_id, set())
+    }
+    print(
+        f"[tiles] applied corridor real scores for {len(valid_scores)} edges "
+        f"({len(invalidated)} affected tiles)"
+    )
+    return len(valid_scores)
 
 
 def refresh_city_predictions(city: str) -> None:
@@ -1620,7 +2067,7 @@ def refresh_city_predictions(city: str) -> None:
     state = GRAPH_CACHE.get(city_slug)
     if state is None or not state.segments:
         return
-    if state.score_source in {"TRAI", "OpenCellID", "OpenCelliD"}:
+    if len(state.real_score_sources) >= len(state.segments):
         return
 
     try:
@@ -1647,7 +2094,14 @@ def prediction_refresh_loop() -> None:
 
 def build_city_state(city: str, graph, expires_at: float) -> CityState:
     city_slug = normalize_city(city)
-    segments, segment_lookup, tile_index, edge_tile_map, tile_counts = build_segments(city_slug, graph)
+    (
+        segments,
+        segment_lookup,
+        tile_index,
+        edge_tile_map,
+        coverage_tile_edge_map,
+        tile_counts,
+    ) = build_segments(city_slug, graph)
     context = derive_city_context(graph)
     gpu_spatial_index = build_gpu_spatial_index(segments)
     zoom12_tiles = tile_counts.get(12, 0)
@@ -1662,32 +2116,33 @@ def build_city_state(city: str, graph, expires_at: float) -> CityState:
         segment_lookup=segment_lookup,
         tile_index=tile_index,
         edge_tile_map=edge_tile_map,
+        coverage_tile_edge_map=coverage_tile_edge_map,
         tile_cache=LRUTileCache(maxsize=500),
         context=context,
         gpu_spatial_index=gpu_spatial_index,
         score_values=to_device_array(np.full(len(segments), 0.5, dtype=np.float32)),
-        score_source="ML_synthetic",
-        score_metadata=default_score_metadata(city_slug, "ML_synthetic"),
+        score_source=PROVENANCE_ML_SYNTHETIC,
+        score_metadata=default_score_metadata(city_slug, PROVENANCE_ML_SYNTHETIC),
     )
     loaded_real = load_real_scores(city_slug, state)
     if loaded_real is not None:
         real_values, metadata = loaded_real
         state.score_values = to_device_array(real_values)
-        state.score_source = str(metadata.get("source") or "OpenCellID")
-        state.score_metadata = metadata
         state.scores_updated_at = time.time()
+        real_source = canonical_provenance(
+            metadata.get("real_data_source") or metadata.get("source")
+        )
+        for segment_index, segment in enumerate(state.segments):
+            if float(real_values[segment_index]) > ROAD_FALLBACK_SCORE + 1e-6:
+                merge_real_score_source(state, segment.segment_id, real_source)
+        refresh_score_metadata(city_slug, state, metadata)
     else:
         coverage_metadata = cached_coverage_metadata(city_slug)
         if coverage_metadata is not None:
-            state.score_source = "OpenCellID"
-            state.score_metadata = {
-                **default_score_metadata(city_slug, "OpenCellID", updated_at=time.time()),
-                **coverage_metadata,
-            }
-            state.scores_updated_at = time.time()
             print(
-                f"[scores] Using cached OpenCellID coverage for {city_slug} "
-                f"({coverage_metadata['coverage_percent']}%)"
+                f"[scores] Cached real-data coverage is available for {city_slug} "
+                f"({coverage_metadata['real_data_coverage_percent']}%); "
+                "initializing the city-wide ML base"
             )
         else:
             print(f"[scores] No real scores for {city_slug}, using ML prediction")
@@ -1759,6 +2214,9 @@ def tile_features(state: CityState, z: int, x: int, y: int) -> list[dict[str, An
         mercator_geometry = shapely_transform(WGS84_TO_WEB_MERCATOR.transform, clipped_geometry)
         properties = dict(segment.properties)
         properties["connectivity_score"] = round(float(candidate_scores[score_index]), 3) if len(candidate_scores) else 0.5
+        properties["provenance_source"] = edge_score_provenance(
+            state, segment.segment_id
+        )
         features.append(
             {
                 "geometry": mercator_geometry,
@@ -1830,6 +2288,9 @@ def hotspots_for_viewport(
                 "radius_meters": 140 if score < 0.3 else 90,
                 "city": state.city,
                 "score": round(score, 3),
+                "provenance_source": edge_score_provenance(
+                    state, segment.segment_id
+                ),
             }
         )
 
@@ -1857,9 +2318,7 @@ def schedule_preload(city: str) -> str:
                     PRELOAD_THREADS.pop(city_slug, None)
 
     with PRELOAD_GUARD_LOCK:
-        existing_state = GRAPH_CACHE.get(city_slug)
-        if existing_state is not None and existing_state.expires_at > time.time():
-            GRAPH_STATUS[city_slug] = "ready"
+        if city_is_ready(city_slug):
             return "ready"
 
         existing = PRELOAD_THREADS.get(city_slug)
@@ -1893,7 +2352,14 @@ def initialize_tower_cache() -> dict[str, int | float | str]:
 def load_local_towers() -> dict[str, Any] | None:
     global LOCAL_TOWER_INDEX
 
-    LOCAL_TOWER_INDEX = load_local_tower_source(logger=print)
+    try:
+        LOCAL_TOWER_INDEX = load_local_tower_source(logger=print)
+    except Exception as exc:
+        LOCAL_TOWER_INDEX = None
+        print(
+            "[local-towers] optional CSV could not be loaded; "
+            f"continuing without it ({type(exc).__name__})"
+        )
     return LOCAL_TOWER_INDEX
 
 
@@ -1915,6 +2381,7 @@ def tower_tiles_table_empty(db_path: Path) -> bool:
 
 def safe_cache_status_payload(city: str | None = None) -> dict[str, Any]:
     city_slug = normalize_city(city or default_city())
+    fresh_cutoff = int(time.time() - TILE_STALE_SECONDS)
     loading_payload = {
         "status": "loading",
         "city": city_slug,
@@ -1923,9 +2390,9 @@ def safe_cache_status_payload(city: str | None = None) -> dict[str, Any]:
         "cached_tiles": 0,
         "remaining_tiles": 0,
         "percent_complete": 0.0,
-        "coverage_percent": 0.0,
         "real_coverage_tiles": 0,
-        "real_coverage_percent": 0.0,
+        "real_data_coverage_percent": 0.0,
+        "coverage_percent": 0.0,
     }
     if not TOWER_CACHE_DB_PATH.exists():
         return loading_payload
@@ -1934,51 +2401,76 @@ def safe_cache_status_payload(city: str | None = None) -> dict[str, Any]:
         with sqlite3.connect(str(TOWER_CACHE_DB_PATH), timeout=1, check_same_thread=False) as conn:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=1000;")
-            row = conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tiles'"
-            ).fetchone()
-            if row is None or int(row[0]) == 0:
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('tiles', 'coverage_tiles')"
+            ).fetchall()
+            if {str(row[0]) for row in tables} != {"tiles", "coverage_tiles"}:
                 return loading_payload
-
             total_tiles = int(
-                conn.execute(
-                    "SELECT COUNT(*) FROM tiles WHERE city = ?",
-                    (city_slug,),
-                ).fetchone()[0]
+                conn.execute("SELECT COUNT(*) FROM tiles WHERE city = ?", (city_slug,)).fetchone()[0]
             )
             cached_tiles = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM tiles WHERE city = ? AND is_cached = 1",
-                    (city_slug,),
+                    """
+                    SELECT COUNT(*) FROM tiles
+                    WHERE city = ? AND is_cached = 1 AND last_updated IS NOT NULL
+                      AND CAST(strftime('%s', last_updated) AS INTEGER) >= ?
+                    """,
+                    (city_slug, fresh_cutoff),
                 ).fetchone()[0]
             )
             real_coverage_tiles = int(
                 conn.execute(
-                    "SELECT COUNT(*) FROM coverage_tiles WHERE city = ? AND has_real_data = 1",
-                    (city_slug,),
+                    """
+                    SELECT COUNT(*)
+                    FROM coverage_tiles AS coverage
+                    JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
+                    WHERE coverage.city = ? AND coverage.has_real_data = 1
+                      AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
+                      AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
+                    """,
+                    (city_slug, fresh_cutoff),
                 ).fetchone()[0]
             )
-    except sqlite3.OperationalError as exc:
-        print(f"[tower-cache] status query busy: {exc}")
+    except sqlite3.Error as exc:
+        print(f"[tower-cache] status query unavailable: {exc}")
         return loading_payload
 
-    remaining_tiles = max(total_tiles - cached_tiles, 0)
-    percent_complete = round((cached_tiles / max(total_tiles, 1)) * 100.0, 1)
-    real_coverage_percent = round((real_coverage_tiles / max(total_tiles, 1)) * 100.0, 1)
-    print(f"[coverage] percent: {real_coverage_percent}")
-    print(f"[cache-status] coverage: {real_coverage_percent}")
+    real_coverage = round((real_coverage_tiles / max(total_tiles, 1)) * 100.0, 1)
     return {
         "status": "ready",
         "city": city_slug,
         "total_tiles": total_tiles,
         "tile_count": total_tiles,
         "cached_tiles": cached_tiles,
-        "remaining_tiles": remaining_tiles,
-        "percent_complete": percent_complete,
-        "coverage_percent": real_coverage_percent,
+        "remaining_tiles": max(total_tiles - cached_tiles, 0),
+        "percent_complete": round((cached_tiles / max(total_tiles, 1)) * 100.0, 1),
         "real_coverage_tiles": real_coverage_tiles,
-        "real_coverage_percent": real_coverage_percent,
+        "real_data_coverage_percent": real_coverage,
+        "coverage_percent": real_coverage,
     }
+
+
+def start_tower_worker_if_available() -> bool:
+    global TOWER_WORKER
+
+    local_towers_ready = bool(LOCAL_TOWER_INDEX and int(LOCAL_TOWER_INDEX.get("count") or 0) > 0)
+    key_status = API_KEY_MANAGER.status() if API_KEY_MANAGER is not None else {"total_keys": 0}
+    if not local_towers_ready and int(key_status.get("total_keys") or 0) <= 0:
+        print("[startup] no local towers or OpenCellID API keys configured; ingestion worker disabled")
+        return False
+    if TOWER_WORKER is None:
+        print("[startup] starting ingestion worker")
+        TOWER_WORKER = TowerIngestionWorker(
+            db_path=TOWER_CACHE_DB_PATH,
+            city=default_city(),
+            key_manager=None if local_towers_ready else API_KEY_MANAGER,
+            logger=print,
+            on_tile_ingested=update_coverage_model,
+            request_delay_seconds=float(os.getenv("OPENCELLID_REQUEST_DELAY_SECONDS", "3")),
+        )
+    TOWER_WORKER.start()
+    return True
 
 
 @app.on_event("startup")
@@ -2000,22 +2492,7 @@ def startup_event() -> None:
             state_path=API_KEY_STATE_PATH,
             logger=print,
         )
-    local_towers_ready = bool(LOCAL_TOWER_INDEX and int(LOCAL_TOWER_INDEX.get("count") or 0) > 0)
-    key_status = API_KEY_MANAGER.status()
-    if not local_towers_ready and int(key_status["total_keys"] or 0) <= 0:
-        print("[startup] no local towers or OpenCellID API keys configured; ingestion worker disabled")
-    elif TOWER_WORKER is None:
-        print("[startup] starting ingestion worker")
-        TOWER_WORKER = TowerIngestionWorker(
-            db_path=TOWER_CACHE_DB_PATH,
-            city=default_city(),
-            key_manager=None if local_towers_ready else API_KEY_MANAGER,
-            logger=print,
-            on_tile_ingested=update_coverage_model,
-            request_delay_seconds=float(os.getenv("OPENCELLID_REQUEST_DELAY_SECONDS", "3")),
-        )
-    if TOWER_WORKER is not None:
-        TOWER_WORKER.start()
+    start_tower_worker_if_available()
     for city in supported_cities():
         GRAPH_STATUS[city] = "idle"
     print(f"[memory] data-service limit {MAX_RAM_MB}MB, current {process_memory_mb():.1f}MB")
@@ -2104,6 +2581,9 @@ def get_segments(city: str) -> dict[str, Any]:
                 "properties": {
                     **segment.properties,
                     "connectivity_score": round(float(score_values[index]), 3),
+                    "provenance_source": edge_score_provenance(
+                        state, segment.segment_id
+                    ),
                 },
             }
             for index, segment in enumerate(state.segments)
@@ -2122,14 +2602,20 @@ def score_source_payload(state: CityState) -> dict[str, Any]:
         **default_score_metadata(state.city, state.score_source, updated_at=state.scores_updated_at),
         **state.score_metadata,
     }
+    real_coverage = first_percentage(
+        metadata,
+        "real_data_coverage_percent",
+        "coverage_percent",
+    )
+    if real_coverage is None:
+        real_coverage = 0.0
     metadata["city"] = state.city
-    metadata["source"] = state.score_source
-    if state.score_source in {"OpenCellID", "OpenCelliD", "TRAI"}:
-        metadata["coverage_percent"] = float(metadata.get("coverage_percent") or summary["coverage_percent"])
-        metadata["dead_zone_percent"] = float(metadata.get("dead_zone_percent") or summary["dead_zone_percent"])
-    else:
-        metadata["coverage_percent"] = summary["coverage_percent"]
-        metadata["dead_zone_percent"] = summary["dead_zone_percent"]
+    metadata["source"] = canonical_provenance(state.score_source)
+    metadata["provenance_source"] = metadata["source"]
+    metadata["real_data_coverage_percent"] = real_coverage
+    metadata["coverage_percent"] = real_coverage
+    metadata["good_signal_percent"] = summary["good_signal_percent"]
+    metadata["dead_zone_percent"] = summary["dead_zone_percent"]
     metadata.setdefault("tower_count", 0)
     if not metadata.get("last_updated"):
         metadata["last_updated"] = time.strftime("%Y-%m-%d", time.gmtime(state.scores_updated_at)) if state.scores_updated_at else ""
@@ -2155,10 +2641,15 @@ def get_scores(city: str) -> dict[str, Any]:
     return {
         "city": normalize_city(city),
         "updated_at": state.scores_updated_at,
-        "source": state.score_source,
+        "source": canonical_provenance(state.score_source),
+        "provenance_source": canonical_provenance(state.score_source),
         "scores": {
             segment.segment_id: round(float(score_values[index]), 3)
             for index, segment in enumerate(state.segments)
+        },
+        "edge_sources": {
+            segment.segment_id: edge_score_provenance(state, segment.segment_id)
+            for segment in state.segments
         },
     }
 
@@ -2216,9 +2707,12 @@ async def get_corridor_towers(
     return {
         "towers": towers or [],
         "count": len(towers or []),
+        "tower_count": len(towers or []),
         "bbox": bbox,
-        "source": metadata.get("source", "ML estimate"),
-        "coverage_percent": metadata.get("coverage_percent", 0.0),
+        "source": canonical_provenance(metadata.get("source")),
+        "provenance_source": canonical_provenance(metadata.get("source")),
+        "real_data_coverage_percent": float(metadata.get("real_data_coverage_percent") or 0.0),
+        "coverage_percent": float(metadata.get("real_data_coverage_percent") or 0.0),
     }
 
 
@@ -2226,6 +2720,16 @@ async def get_corridor_towers(
 async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]:
     if len(payload.origin) != 2 or len(payload.destination) != 2:
         raise HTTPException(status_code=422, detail="origin and destination must contain [lat, lon]")
+    invalid_edges = [
+        str(edge_id)
+        for edge_id, coordinates in payload.edge_coords.items()
+        if len(coordinates) != 2
+    ]
+    if invalid_edges:
+        raise HTTPException(
+            status_code=422,
+            detail="each edge_coords value must contain [lat, lon]",
+        )
 
     towers, bbox, metadata = await fetch_towers_cached(
         float(payload.origin[0]),
@@ -2234,40 +2738,85 @@ async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]
         float(payload.destination[1]),
         payload.padding_km,
     )
-    coverage_percent = float(metadata.get("coverage_percent", 0.0))
-    if not towers and coverage_percent == 0.0:
-        return {
-            "scores": {},
-            "source": "ML estimate",
-            "tower_count": 0,
-            "bbox": bbox,
-            "coverage_percent": coverage_percent,
-            "real_data_percent": coverage_percent,
-        }
-
     query_tiles = list(metadata.get("query_tiles") or [])
     covered_tile_ids = set(metadata.get("covered_tile_ids") or set())
-    real_edge_coords = corridor_real_edge_coords(payload.edge_coords, query_tiles, covered_tile_ids)
-    if towers and real_edge_coords:
-        scores = compute_scores_from_towers(real_edge_coords, towers)
-    elif towers:
-        scores = compute_scores_from_towers(payload.edge_coords, towers)
+    tile_sources = {
+        str(tile_id): canonical_provenance(source)
+        for tile_id, source in dict(metadata.get("tile_sources") or {}).items()
+    }
+    if towers and metadata.get("live_full_bbox"):
+        real_edge_coords = {
+            str(edge_id): (float(coords[0]), float(coords[1]))
+            for edge_id, coords in payload.edge_coords.items()
+        }
+        live_source = canonical_provenance(
+            metadata.get("real_data_source") or metadata.get("source")
+        )
+        real_edge_sources = {
+            edge_id: live_source for edge_id in real_edge_coords
+        }
+    elif covered_tile_ids:
+        real_edge_coords, real_edge_sources = corridor_real_edge_coords(
+            payload.edge_coords,
+            query_tiles,
+            covered_tile_ids,
+            tile_sources,
+        )
     else:
-        scores = {}
+        real_edge_coords = {}
+        real_edge_sources = {}
+
+    scores = (
+        compute_scores_from_towers(real_edge_coords, towers or [])
+        if towers
+        else {edge_id: ROAD_FALLBACK_SCORE for edge_id in real_edge_coords}
+    )
+    real_source = canonical_provenance(
+        metadata.get("real_data_source") or metadata.get("source")
+    )
+    for edge_id in real_edge_coords:
+        if real_edge_sources.get(edge_id, PROVENANCE_UNKNOWN) == PROVENANCE_UNKNOWN:
+            real_edge_sources[edge_id] = real_source
+    total_edges = len(payload.edge_coords)
+    real_edges = len(real_edge_coords)
+    real_coverage = round((real_edges / max(total_edges, 1)) * 100.0, 1) if total_edges else 0.0
+    if real_edges <= 0:
+        source = PROVENANCE_ML_SYNTHETIC
+    elif real_edges < total_edges:
+        source = PROVENANCE_HYBRID
+    else:
+        source = real_source
+    edge_sources = {
+        str(edge_id): (
+            real_edge_sources.get(str(edge_id), PROVENANCE_UNKNOWN)
+            if str(edge_id) in real_edge_coords
+            else PROVENANCE_ML_SYNTHETIC
+        )
+        for edge_id in payload.edge_coords
+    }
+    good_signal = round(
+        (sum(1 for score in scores.values() if float(score) >= 0.6) / max(len(scores), 1)) * 100.0,
+        1,
+    ) if scores else 0.0
     return {
         "scores": scores,
-        "source": metadata.get("source", "OpenCellID" if coverage_percent > 0.0 else "ML estimate"),
+        "source": source,
+        "provenance_source": source,
+        "real_data_source": real_source if real_edges else PROVENANCE_UNKNOWN,
+        "edge_sources": edge_sources,
         "tower_count": len(towers or []),
         "bbox": bbox,
-        "coverage_percent": coverage_percent,
-        "real_data_percent": coverage_percent,
+        "real_data_coverage_percent": real_coverage,
+        "good_signal_percent": good_signal,
+        "coverage_percent": real_coverage,
+        "real_data_percent": real_coverage,
     }
 
 
 @app.post("/corridor-feedback/{city}")
 def post_corridor_feedback(city: str, payload: CorridorTileUpdateRequest) -> dict[str, Any]:
     try:
-        updated = update_corridor_tiles(city, payload.scores)
+        updated = update_corridor_tiles(city, payload.scores, payload.edge_sources)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -2281,6 +2830,8 @@ def post_corridor_feedback(city: str, payload: CorridorTileUpdateRequest) -> dic
 @app.get("/cache-status")
 def cache_status() -> dict[str, Any]:
     payload = safe_cache_status_payload(default_city())
+    if TOWER_WORKER is not None:
+        payload["queued_tiles"] = int(TOWER_WORKER.status().get("queued_tiles") or 0)
     payload["db_path"] = str(TOWER_CACHE_DB_PATH)
     payload["ingestion_running"] = bool(TOWER_WORKER is not None and TOWER_WORKER.is_running())
     payload["local_towers"] = local_tower_source_status()
@@ -2310,7 +2861,7 @@ def preload(city: str) -> dict[str, Any]:
 def memory() -> dict[str, Any]:
     state = GRAPH_CACHE.get(ACTIVE_CITY) if ACTIVE_CITY else None
     gpu_arrays_mb = round(array_nbytes(state.score_values) / (1024 * 1024), 1) if state and state.score_values is not None else 0.0
-    cache_payload = persistent_cache_status(TOWER_CACHE_DB_PATH, default_city())
+    cache_payload = safe_cache_status_payload(default_city())
     return {
         "ram_mb": round(process_memory_mb(), 1),
         "vram_mb": round(current_vram_mb(), 1),
@@ -2334,9 +2885,23 @@ def health() -> dict[str, Any]:
         "active_city": ACTIVE_CITY,
         "graph_status": GRAPH_STATUS,
         "graph_errors": GRAPH_ERRORS,
-        "graph_ready": bool(GRAPH_STATUS.get(city_slug) == "ready" and city_slug in GRAPH_CACHE),
+        "graph_ready": city_is_ready(city_slug),
         "tower_cache": cache_payload,
         "local_towers": local_tower_source_status(),
         "api_keys": API_KEY_MANAGER.status() if API_KEY_MANAGER is not None else None,
         "ingestion_running": bool(TOWER_WORKER is not None and TOWER_WORKER.is_running()),
     }
+
+
+@app.get("/ready")
+def ready() -> Response:
+    city_slug = default_city()
+    graph_ready = city_is_ready(city_slug)
+    payload = {
+        "status": "ready" if graph_ready else "not_ready",
+        "service": "data-service",
+        "city": city_slug,
+        "graph_ready": graph_ready,
+        "graph_status": GRAPH_STATUS.get(city_slug, "idle"),
+    }
+    return JSONResponse(status_code=200 if graph_ready else 503, content=payload)

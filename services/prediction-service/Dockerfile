@@ -1,4 +1,4 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -8,16 +8,17 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv ca-certificates \
+    && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip \
-    && python3 -m venv $VIRTUAL_ENV \
+    && python -m venv $VIRTUAL_ENV \
     && $VIRTUAL_ENV/bin/pip install --no-cache-dir --upgrade pip
 
 COPY requirements.txt requirements-gpu.txt ./
+ARG INSTALL_GPU_REQUIREMENTS=0
 RUN $VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements.txt \
-    && ($VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements-gpu.txt || true)
+    && if [ "$INSTALL_GPU_REQUIREMENTS" = "1" ]; then \
+         $VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements-gpu.txt; \
+       fi
 
 COPY main.py ./main.py
 

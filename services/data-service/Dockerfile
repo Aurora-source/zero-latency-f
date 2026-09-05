@@ -13,7 +13,7 @@ RUN python -m venv $VIRTUAL_ENV \
 COPY requirements.txt .
 RUN $VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements.txt
 
-COPY main.py ./main.py
+COPY main.py api_key_manager.py tile_loader.py tower_ingestion_worker.py ./
 
 EXPOSE 8001
 
