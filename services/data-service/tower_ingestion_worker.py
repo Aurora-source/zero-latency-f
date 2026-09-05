@@ -96,10 +96,15 @@ class TowerIngestionWorker:
         except queue.Empty:
             stale = stale_tile_ids(self.db_path, self.city, limit=1)
             if stale:
-                return stale[0]
+                tile_id = stale[0]
+                with self._lock:
+                    if tile_id in self._queued_ids:
+                        return None
+                    self._queued_ids.add(tile_id)
+                return tile_id
         return None
 
-    def _mark_dequeued(self, tile_id: str) -> None:
+    def _release_tile(self, tile_id: str) -> None:
         with self._lock:
             self._queued_ids.discard(tile_id)
 
@@ -109,16 +114,21 @@ class TowerIngestionWorker:
             if tile_id is None:
                 self._stop.wait(2.0)
                 continue
-            if self.key_manager is not None:
-                if not self.key_manager.wait_until_available(self._stop):
-                    return
-            self._mark_dequeued(tile_id)
-            result = self._fetch_and_store_tile(tile_id)
-            if result.status == "ok" and self.on_tile_ingested is not None:
-                try:
-                    self.on_tile_ingested(self.city, tile_id, result.tower_count)
-                except Exception as exc:
-                    self.logger(f"[tower-cache] adaptive sync failed for {tile_id}: {exc}")
+            try:
+                if self.key_manager is not None:
+                    if not self.key_manager.wait_until_available(self._stop):
+                        return
+                result = self._fetch_and_store_tile(tile_id)
+                if result.status == "ok" and self.on_tile_ingested is not None:
+                    try:
+                        self.on_tile_ingested(self.city, tile_id, result.tower_count)
+                    except Exception as exc:
+                        self.logger(f"[tower-cache] adaptive sync failed for {tile_id}: {exc}")
+            finally:
+                # The reservation covers fetch, persistence, and the adaptive score
+                # callback. Concurrent corridor requests cannot queue this tile again
+                # until every part of its ingestion attempt has completed.
+                self._release_tile(tile_id)
             if self.request_delay_seconds > 0:
                 self._stop.wait(self.request_delay_seconds)
 

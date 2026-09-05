@@ -329,7 +329,10 @@ class CachePersistenceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_path = Path(tmpdir) / "route_cache.json"
-            self.routing[route_cache_path_key] = temp_path
+            cache_globals = store_cached_route.__globals__
+            path_patch = patch.dict(cache_globals, {route_cache_path_key: temp_path})
+            path_patch.start()
+            self.addCleanup(path_patch.stop)
             route_cache.clear()
 
             response = {"mode": "balanced", "total_time_min": 12.4}
@@ -383,7 +386,10 @@ class CachePersistenceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             temp_path = Path(tmpdir) / "hotspots.json"
-            self.data[hotspot_cache_path_key] = temp_path
+            cache_globals = store_cached_hotspots.__globals__
+            path_patch = patch.dict(cache_globals, {hotspot_cache_path_key: temp_path})
+            path_patch.start()
+            self.addCleanup(path_patch.stop)
             hotspot_cache.clear()
             payload = [{"id": "seg-1", "lat": 12.97, "lon": 77.59, "score": 0.2}]
 

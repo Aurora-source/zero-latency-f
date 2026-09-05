@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import gc
 import json
@@ -9,6 +10,7 @@ import pickle
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zlib
@@ -16,7 +18,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib import error, request
 
 import httpx
@@ -134,6 +136,8 @@ OPENCELLID_TOKEN = os.getenv("OPENCELLID_TOKEN", "").strip()
 OPENCELLID_MAX_BBOX_AREA_M2 = 4_000_000.0
 OPENCELLID_CHUNK_SIDE_KM = 1.8
 CORRIDOR_CACHE_TTL = 600
+GRAPH_LOAD_MAX_ATTEMPTS = 3
+GRAPH_LOAD_RETRY_BACKOFF_SECONDS = (5.0, 10.0)
 DATA_DIR = SERVICE_DIR / "data"
 APP_CACHE_DIR = Path(os.getenv("APP_CACHE_DIR", str(SERVICE_DIR / "cache")))
 GRAPH_CACHE_DIR = Path(os.getenv("GRAPH_CACHE_DIR", str(APP_CACHE_DIR / "graphs")))
@@ -149,7 +153,10 @@ CITY_PLACE_QUERIES: dict[str, str] = {
     "bangalore": os.getenv("BANGALORE_PLACE_QUERY", DEFAULT_BANGALORE_QUERY),
 }
 GRAPH_CACHE: dict[str, "CityState"] = {}
-CITY_LOCKS = defaultdict(threading.Lock)
+# Compose runs one data-service process. These in-memory locks and single-flight
+# registries coordinate that process; GraphML publication remains atomic for the
+# separate routing reader process.
+CITY_LOCKS = defaultdict(threading.RLock)
 PRELOAD_GUARD_LOCK = threading.Lock()
 SCHEDULER_STOP = threading.Event()
 SCHEDULER_THREAD: threading.Thread | None = None
@@ -158,6 +165,11 @@ CORRIDOR_CACHE: dict[
     tuple[float, float, float, float],
     tuple[list[dict[str, Any]], float, bool, str],
 ] = {}
+CORRIDOR_CACHE_LOCK = threading.Lock()
+CORRIDOR_FETCH_TASKS: dict[
+    tuple[float, float, float, float], asyncio.Task[Any]
+] = {}
+CORRIDOR_SCORE_TASKS: dict[tuple[Any, ...], asyncio.Task[Any]] = {}
 WGS84_TO_WEB_MERCATOR = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 EMPTY_TILE = mapbox_vector_tile.encode({"name": MVT_LAYER_NAME, "features": []})
 ACTIVE_CITY: str | None = None
@@ -170,6 +182,10 @@ PROXY_ENV_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
 TOWER_WORKER: TowerIngestionWorker | None = None
 API_KEY_MANAGER: APIKeyManager | None = None
 LOCAL_TOWER_INDEX: dict[str, Any] | None = None
+
+
+class GraphLoadTransientError(RuntimeError):
+    """A graph source failed in a way that may succeed on a bounded retry."""
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
@@ -822,6 +838,33 @@ def get_corridor_cache_key(
     )
 
 
+async def run_singleflight(
+    tasks: dict[Any, asyncio.Task[Any]],
+    key: Any,
+    operation: Callable[[], Awaitable[Any]],
+) -> Any:
+    """Share one in-flight operation among equivalent requests in this process."""
+    current_loop = asyncio.get_running_loop()
+    with CORRIDOR_CACHE_LOCK:
+        task = tasks.get(key)
+        if task is None or task.done() or task.get_loop() is not current_loop:
+            task = current_loop.create_task(operation())
+            tasks[key] = task
+
+            def cleanup(completed: asyncio.Task[Any]) -> None:
+                # Retrieve failures even if every waiter was cancelled, avoiding an
+                # orphaned task warning without changing what active awaiters see.
+                if not completed.cancelled():
+                    completed.exception()
+                with CORRIDOR_CACHE_LOCK:
+                    if tasks.get(key) is completed:
+                        tasks.pop(key, None)
+
+            task.add_done_callback(cleanup)
+
+    return await asyncio.shield(task)
+
+
 def configured_proxy_env() -> dict[str, str]:
     return {
         name: value
@@ -948,7 +991,7 @@ def queue_missing_tower_tiles(tile_ids: list[str]) -> int:
     return TOWER_WORKER.enqueue_tiles(tile_ids)
 
 
-async def fetch_towers_cached(
+async def _fetch_towers_cached(
     origin_lat: float,
     origin_lon: float,
     dest_lat: float,
@@ -965,7 +1008,8 @@ async def fetch_towers_cached(
     key = get_corridor_cache_key(min_lat, min_lon, max_lat, max_lon)
     now = time.time()
     city_slug = default_city()
-    cached = CORRIDOR_CACHE.get(key)
+    with CORRIDOR_CACHE_LOCK:
+        cached = CORRIDOR_CACHE.get(key)
     if cached is not None:
         towers, cached_at, cached_live_full_bbox, cached_live_source = cached
         if now - cached_at < CORRIDOR_CACHE_TTL:
@@ -992,7 +1036,9 @@ async def fetch_towers_cached(
                 "max_lat": key[2],
                 "max_lon": key[3],
             }, metadata
-        CORRIDOR_CACHE.pop(key, None)
+        with CORRIDOR_CACHE_LOCK:
+            if CORRIDOR_CACHE.get(key) is cached:
+                CORRIDOR_CACHE.pop(key, None)
         print(f"[towers] cache expired for bbox {key}")
 
     towers, missing_tile_ids, covered_tile_ids, query_tiles = cached_towers_for_bbox(
@@ -1028,7 +1074,8 @@ async def fetch_towers_cached(
             )
             if towers:
                 live_source = tower_provenance_source()
-                CORRIDOR_CACHE[key] = (towers, now, True, live_source)
+                with CORRIDOR_CACHE_LOCK:
+                    CORRIDOR_CACHE[key] = (towers, time.time(), True, live_source)
                 metadata = corridor_coverage_metadata(
                     towers,
                     [],
@@ -1044,6 +1091,35 @@ async def fetch_towers_cached(
         "max_lat": key[2],
         "max_lon": key[3],
     }, metadata
+
+
+async def fetch_towers_cached(
+    origin_lat: float,
+    origin_lon: float,
+    dest_lat: float,
+    dest_lon: float,
+    padding_km: float = 3.0,
+) -> tuple[list[dict[str, Any]] | None, dict[str, float], dict[str, Any]]:
+    bbox_key = get_corridor_cache_key(
+        *corridor_bbox(
+            origin_lat,
+            origin_lon,
+            dest_lat,
+            dest_lon,
+            padding_km,
+        )
+    )
+    return await run_singleflight(
+        CORRIDOR_FETCH_TASKS,
+        bbox_key,
+        lambda: _fetch_towers_cached(
+            origin_lat,
+            origin_lon,
+            dest_lat,
+            dest_lon,
+            padding_km,
+        ),
+    )
 
 
 def tower_provenance_source() -> str:
@@ -1257,7 +1333,8 @@ def coverage_scores_for_tile(
 
 
 def update_coverage_model(city: str, tile_id: str, tower_count: int) -> None:
-    CORRIDOR_CACHE.clear()
+    with CORRIDOR_CACHE_LOCK:
+        CORRIDOR_CACHE.clear()
     city_slug = normalize_city(city)
     state = GRAPH_CACHE.get(city_slug)
     if state is None:
@@ -1781,6 +1858,28 @@ def graph_cache_path(city: str) -> Path:
     return GRAPH_CACHE_DIR / f"{normalize_city(city)}.graphml"
 
 
+def publish_graph_cache(graph: Any, cache_path: Path) -> None:
+    """Atomically publish the GraphML file owned by the data service.
+
+    Routing processes share this directory as readers. Writing a sibling temporary
+    file first ensures they observe either the previous complete graph or the new
+    complete graph, including when serialization is interrupted.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=cache_path.parent,
+        prefix=f".{cache_path.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        ox.save_graphml(graph, temporary_path)
+        os.replace(temporary_path, cache_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
 def simplify_city_graph(city: str, graph):
     try:
         graph = ox.simplify_graph(graph)
@@ -1814,11 +1913,7 @@ def load_or_fetch_graph(city: str):
 
     local_graph = load_local_graph_fallback(city_slug)
     if local_graph is not None:
-        if cache_path != local_graph_fallback_paths(city_slug)[0]:
-            try:
-                ox.save_graphml(local_graph, cache_path)
-            except Exception as exc:
-                print(f"[graph] failed to persist local graph cache to {cache_path}: {exc}")
+        publish_graph_cache(local_graph, cache_path)
         print("[graph] local graph loaded")
         return local_graph
 
@@ -1828,6 +1923,7 @@ def load_or_fetch_graph(city: str):
     print("[graph] geocode fallback used")
     polygon = geocode_place_boundary(city_slug)
     attempt_errors: list[str] = []
+    attempt_exceptions: list[Exception] = []
 
     for attempt_number, overpass_url in enumerate(overpass_urls, start=1):
         try:
@@ -1845,18 +1941,25 @@ def load_or_fetch_graph(city: str):
                     truncate_by_edge=True,
                 )
             graph = simplify_city_graph(city_slug, graph)
-            ox.save_graphml(graph, cache_path)
+            publish_graph_cache(graph, cache_path)
             print(f"[graph] Saved Bangalore graph cache to {cache_path}")
             return graph
         except Exception as exc:
             error_message = f"{overpass_url} -> {type(exc).__name__}: {exc}"
             attempt_errors.append(error_message)
+            attempt_exceptions.append(exc)
             print(f"[graph] attempt {attempt_number} failed: {error_message}")
 
-    raise RuntimeError(
+    message = (
         "All Overpass endpoints failed for "
         f"{city_slug} after {len(attempt_errors)} attempt(s): {'; '.join(attempt_errors)}"
     )
+    if attempt_exceptions and all(
+        isinstance(exc, (TimeoutError, OSError, error.URLError))
+        for exc in attempt_exceptions
+    ):
+        raise GraphLoadTransientError(message)
+    raise RuntimeError(message)
 
 
 def load_city_state(city: str) -> CityState:
@@ -1878,17 +1981,19 @@ def load_city_state(city: str) -> CityState:
 
         graph = load_or_fetch_graph(city_slug)
         state = build_city_state(city_slug, graph, now + CACHE_TTL_SECONDS)
+        try:
+            hydrate_cached_coverage(city_slug, state)
+        except Exception as exc:
+            print(
+                f"[adaptive] cached coverage restore skipped ({type(exc).__name__})"
+            )
+        refresh_state_predictions(city_slug, state)
+
+        # Publish only after score hydration is complete. Readers therefore get one
+        # internally consistent graph/segment/score state.
         GRAPH_CACHE[city_slug] = state
         ACTIVE_CITY = city_slug
-
-    try:
-        hydrate_cached_coverage(city_slug, state)
-    except Exception as exc:
-        print(
-            f"[adaptive] cached coverage restore skipped ({type(exc).__name__})"
-        )
-    refresh_city_predictions(city_slug)
-    return GRAPH_CACHE[city_slug]
+        return state
 
 
 def city_is_ready(city: str) -> bool:
@@ -2062,10 +2167,9 @@ def update_corridor_tiles(
     return len(valid_scores)
 
 
-def refresh_city_predictions(city: str) -> None:
+def refresh_state_predictions(city: str, state: CityState) -> None:
     city_slug = normalize_city(city)
-    state = GRAPH_CACHE.get(city_slug)
-    if state is None or not state.segments:
+    if not state.segments:
         return
     if len(state.real_score_sources) >= len(state.segments):
         return
@@ -2081,6 +2185,13 @@ def refresh_city_predictions(city: str) -> None:
         f"[prediction] refreshed {city_slug} with {len(scores)} segment scores "
         f"from {metadata['data_source']}"
     )
+
+
+def refresh_city_predictions(city: str) -> None:
+    city_slug = normalize_city(city)
+    state = GRAPH_CACHE.get(city_slug)
+    if state is not None:
+        refresh_state_predictions(city_slug, state)
 
 
 def prediction_refresh_loop() -> None:
@@ -2303,14 +2414,45 @@ def schedule_preload(city: str) -> str:
 
     def runner() -> None:
         try:
-            print(f"[graph] Loading Bangalore graph (cached: {'yes' if graph_cache_path(city_slug).exists() else 'no'})")
-            load_city_state(city_slug)
-            GRAPH_STATUS[city_slug] = "ready"
-            print("[graph] Loaded successfully")
-        except Exception as exc:
-            GRAPH_STATUS[city_slug] = "error"
-            GRAPH_ERRORS[city_slug] = str(exc)
-            print(f"[graph] preload failed for {city_slug}: {exc}")
+            for attempt in range(1, GRAPH_LOAD_MAX_ATTEMPTS + 1):
+                try:
+                    print(
+                        f"[graph] Loading Bangalore graph (cached: "
+                        f"{'yes' if graph_cache_path(city_slug).exists() else 'no'})"
+                    )
+                    load_city_state(city_slug)
+                except (GraphLoadTransientError, TimeoutError, OSError, error.URLError) as exc:
+                    if attempt >= GRAPH_LOAD_MAX_ATTEMPTS:
+                        GRAPH_STATUS[city_slug] = "error"
+                        GRAPH_ERRORS[city_slug] = str(exc)
+                        print(
+                            f"[graph] preload exhausted {attempt} attempt(s) "
+                            f"for {city_slug}: {exc}"
+                        )
+                        return
+                    delay = GRAPH_LOAD_RETRY_BACKOFF_SECONDS[
+                        min(attempt - 1, len(GRAPH_LOAD_RETRY_BACKOFF_SECONDS) - 1)
+                    ]
+                    print(
+                        f"[graph] transient preload failure for {city_slug}; "
+                        f"retrying in {delay:g}s (attempt {attempt + 1}/"
+                        f"{GRAPH_LOAD_MAX_ATTEMPTS}): {exc}"
+                    )
+                    if SCHEDULER_STOP.wait(delay):
+                        GRAPH_STATUS[city_slug] = "error"
+                        GRAPH_ERRORS[city_slug] = "Graph loading stopped during shutdown"
+                        return
+                    continue
+                except Exception as exc:
+                    GRAPH_STATUS[city_slug] = "error"
+                    GRAPH_ERRORS[city_slug] = str(exc)
+                    print(f"[graph] preload failed for {city_slug}: {exc}")
+                    return
+
+                GRAPH_STATUS[city_slug] = "ready"
+                GRAPH_ERRORS.pop(city_slug, None)
+                print("[graph] Loaded successfully")
+                return
         finally:
             with PRELOAD_GUARD_LOCK:
                 active_thread = PRELOAD_THREADS.get(city_slug)
@@ -2592,16 +2734,24 @@ def get_segments(city: str) -> dict[str, Any]:
 
 
 def score_source_payload(state: CityState) -> dict[str, Any]:
-    score_values = (
-        to_numpy_array(state.score_values).astype(np.float32, copy=False)
-        if state.score_values is not None
-        else np.full(len(state.segments), 0.5, dtype=np.float32)
-    )
+    with CITY_LOCKS[state.city]:
+        score_values = (
+            to_numpy_array(state.score_values).astype(np.float32, copy=True)
+            if state.score_values is not None
+            else np.full(len(state.segments), 0.5, dtype=np.float32)
+        )
+        city = state.city
+        score_source = state.score_source
+        scores_updated_at = state.scores_updated_at
+        metadata = {
+            **default_score_metadata(
+                city,
+                score_source,
+                updated_at=scores_updated_at,
+            ),
+            **state.score_metadata,
+        }
     summary = score_summary(score_values)
-    metadata = {
-        **default_score_metadata(state.city, state.score_source, updated_at=state.scores_updated_at),
-        **state.score_metadata,
-    }
     real_coverage = first_percentage(
         metadata,
         "real_data_coverage_percent",
@@ -2609,8 +2759,8 @@ def score_source_payload(state: CityState) -> dict[str, Any]:
     )
     if real_coverage is None:
         real_coverage = 0.0
-    metadata["city"] = state.city
-    metadata["source"] = canonical_provenance(state.score_source)
+    metadata["city"] = city
+    metadata["source"] = canonical_provenance(score_source)
     metadata["provenance_source"] = metadata["source"]
     metadata["real_data_coverage_percent"] = real_coverage
     metadata["coverage_percent"] = real_coverage
@@ -2618,7 +2768,9 @@ def score_source_payload(state: CityState) -> dict[str, Any]:
     metadata["dead_zone_percent"] = summary["dead_zone_percent"]
     metadata.setdefault("tower_count", 0)
     if not metadata.get("last_updated"):
-        metadata["last_updated"] = time.strftime("%Y-%m-%d", time.gmtime(state.scores_updated_at)) if state.scores_updated_at else ""
+        metadata["last_updated"] = time.strftime(
+            "%Y-%m-%d", time.gmtime(scores_updated_at)
+        ) if scores_updated_at else ""
     return metadata
 
 
@@ -2632,25 +2784,31 @@ def get_scores(city: str) -> dict[str, Any]:
     if state.score_values is None:
         refresh_city_predictions(city)
 
-    score_values = (
-        to_numpy_array(state.score_values).astype(np.float32, copy=False)
-        if state.score_values is not None
-        else np.full(len(state.segments), 0.5, dtype=np.float32)
-    )
+    city_slug = normalize_city(city)
+    with CITY_LOCKS[city_slug]:
+        score_values = (
+            to_numpy_array(state.score_values).astype(np.float32, copy=True)
+            if state.score_values is not None
+            else np.full(len(state.segments), 0.5, dtype=np.float32)
+        )
+        segments = tuple(state.segments)
+        updated_at = state.scores_updated_at
+        source = canonical_provenance(state.score_source)
+        edge_sources = {
+            segment.segment_id: edge_score_provenance(state, segment.segment_id)
+            for segment in segments
+        }
 
     return {
-        "city": normalize_city(city),
-        "updated_at": state.scores_updated_at,
-        "source": canonical_provenance(state.score_source),
-        "provenance_source": canonical_provenance(state.score_source),
+        "city": city_slug,
+        "updated_at": updated_at,
+        "source": source,
+        "provenance_source": source,
         "scores": {
             segment.segment_id: round(float(score_values[index]), 3)
-            for index, segment in enumerate(state.segments)
+            for index, segment in enumerate(segments)
         },
-        "edge_sources": {
-            segment.segment_id: edge_score_provenance(state, segment.segment_id)
-            for segment in state.segments
-        },
+        "edge_sources": edge_sources,
     }
 
 
@@ -2716,8 +2874,24 @@ async def get_corridor_towers(
     }
 
 
-@app.post("/corridor-scores")
-async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]:
+def corridor_score_request_key(payload: CorridorScoresRequest) -> tuple[Any, ...]:
+    return (
+        tuple(float(value) for value in payload.origin),
+        tuple(float(value) for value in payload.destination),
+        float(payload.padding_km),
+        tuple(
+            sorted(
+                (
+                    str(edge_id),
+                    tuple(float(value) for value in coordinates),
+                )
+                for edge_id, coordinates in payload.edge_coords.items()
+            )
+        ),
+    )
+
+
+async def _calculate_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]:
     if len(payload.origin) != 2 or len(payload.destination) != 2:
         raise HTTPException(status_code=422, detail="origin and destination must contain [lat, lon]")
     invalid_edges = [
@@ -2811,6 +2985,15 @@ async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]
         "coverage_percent": real_coverage,
         "real_data_percent": real_coverage,
     }
+
+
+@app.post("/corridor-scores")
+async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]:
+    return await run_singleflight(
+        CORRIDOR_SCORE_TASKS,
+        corridor_score_request_key(payload),
+        lambda: _calculate_corridor_scores(payload),
+    )
 
 
 @app.post("/corridor-feedback/{city}")

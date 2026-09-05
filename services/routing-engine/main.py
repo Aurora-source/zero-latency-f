@@ -3,19 +3,23 @@ from __future__ import annotations
 import ast
 import asyncio
 import gc
+import hashlib
 import json
 import math
 import os
 import subprocess
+import tempfile
 import time
 from collections import Counter, OrderedDict, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any, Literal
 from urllib import error, request
+from uuid import uuid4
 
 import networkx as nx
 import numpy as np
@@ -41,7 +45,10 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 SCORE_REFRESH_SECONDS = 60
 ROUTE_CACHE_TTL_SECONDS = 10 * 60
 ROUTE_CACHE_MAX_ENTRIES = 200
-ROUTE_CACHE_SCHEMA_VERSION = 4
+ROUTE_CACHE_SCHEMA_VERSION = 5
+GRAPH_LOAD_MAX_ATTEMPTS = 3
+GRAPH_LOAD_RETRY_SECONDS = 5
+GRAPH_PUBLICATION_WAIT_SECONDS = 10 * 60
 DEFAULT_SUPPORTED_CITIES = "bangalore"
 DEFAULT_DEFAULT_CITY = "bangalore"
 DEFAULT_DATA_SERVICE_URL = "http://data-service:8001"
@@ -69,7 +76,10 @@ GPU_NAME = "CPU"
 ACTIVE_CITY: str | None = None
 MAX_RAM_MB = int(os.getenv("MAX_RAM_MB", "2048"))
 ROUTE_CACHE_LOCK = Lock()
+ROUTE_CACHE_WRITE_LOCK = Lock()
 ROUTE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+ROUTE_FLIGHTS_LOCK = Lock()
+ROUTE_FLIGHTS: dict[tuple[Any, ...], Future] = {}
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
@@ -165,6 +175,22 @@ class GraphState:
     vehicle_graphs: dict[str, PreparedVehicleGraph] = field(default_factory=dict)
     lock: Lock = field(default_factory=Lock)
     score_refreshing: bool = False
+    snapshot_id: str = field(default_factory=lambda: uuid4().hex)
+
+
+@dataclass(frozen=True)
+class RouteSnapshot:
+    """Published graph/arrays are read-only; writers replace them together."""
+
+    base_graph: Any
+    node_index: dict[str, Any] | None
+    vehicle_graphs: dict[str, PreparedVehicleGraph]
+    scores_updated_at: float
+    snapshot_id: str
+
+
+class GraphNotPublishedError(FileNotFoundError):
+    """Data service has not yet atomically published the shared city graph."""
 
 
 STRATEGY_FACTORS: dict[str, dict[str, float]] = {
@@ -401,10 +427,32 @@ def load_route_cache() -> None:
 
 
 def persist_route_cache() -> None:
-    ROUTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with ROUTE_CACHE_LOCK:
-        payload = dict(ROUTE_CACHE)
-    ROUTE_CACHE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    # The single routing process owns this file. Serialize snapshot + publication,
+    # so a slow earlier writer cannot replace a newer snapshot on disk.
+    with ROUTE_CACHE_WRITE_LOCK:
+        temporary_path = None
+        try:
+            ROUTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with ROUTE_CACHE_LOCK:
+                payload = dict(ROUTE_CACHE)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=ROUTE_CACHE_PATH.parent,
+                prefix=f".{ROUTE_CACHE_PATH.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                json.dump(payload, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, ROUTE_CACHE_PATH)
+        except (OSError, TypeError, ValueError) as exc:
+            # Persistence is an optimization; a successful route still succeeds.
+            print(f"[cache] failed to persist route cache: {exc}")
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"[cache] failed to remove temporary route cache: {exc}")
 
 
 def route_cache_key(
@@ -414,6 +462,7 @@ def route_cache_key(
     mode: str,
     vehicle: str,
     risk_time_bucket: str | None = None,
+    snapshot_id: str = "",
 ) -> str:
     return json.dumps(
         {
@@ -423,6 +472,7 @@ def route_cache_key(
             "mode": mode,
             "vehicle": vehicle,
             "risk_time_bucket": risk_time_bucket or city_risk_time_bucket(city),
+            "snapshot_id": snapshot_id,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -437,6 +487,7 @@ def get_cached_route(
     vehicle: str,
     score_version: float,
     risk_time_bucket: str | None = None,
+    snapshot_id: str = "",
 ) -> dict[str, Any] | None:
     cache_key = route_cache_key(
         city,
@@ -445,19 +496,27 @@ def get_cached_route(
         mode,
         vehicle,
         risk_time_bucket,
+        snapshot_id,
     )
     now = time.time()
     with ROUTE_CACHE_LOCK:
         entry = ROUTE_CACHE.get(cache_key)
         if entry is None:
             return None
-        stored_at = float(entry.get("stored_at") or 0.0)
-        cached_score_version = float(entry.get("score_version") or 0.0)
-        schema_version = int(entry.get("schema_version") or 0)
+        try:
+            stored_at = float(entry.get("stored_at") or 0.0)
+            cached_score_version = float(entry.get("score_version") or 0.0)
+            schema_version = int(entry.get("schema_version") or 0)
+        except (TypeError, ValueError, OverflowError):
+            ROUTE_CACHE.pop(cache_key, None)
+            return None
         if (
             schema_version != ROUTE_CACHE_SCHEMA_VERSION
+            or not math.isfinite(stored_at)
+            or not math.isfinite(cached_score_version)
+            or stored_at > now
             or now - stored_at > ROUTE_CACHE_TTL_SECONDS
-            or cached_score_version < score_version
+            or cached_score_version != score_version
         ):
             ROUTE_CACHE.pop(cache_key, None)
             return None
@@ -465,7 +524,7 @@ def get_cached_route(
         response = entry.get("response")
         if isinstance(response, dict):
             print(f"[cache] route hit for {city}/{mode}/{vehicle}")
-            return response
+            return deepcopy(response)
     return None
 
 
@@ -478,6 +537,7 @@ def store_cached_route(
     score_version: float,
     response: dict[str, Any],
     risk_time_bucket: str | None = None,
+    snapshot_id: str = "",
 ) -> None:
     cache_key = route_cache_key(
         city,
@@ -486,13 +546,14 @@ def store_cached_route(
         mode,
         vehicle,
         risk_time_bucket,
+        snapshot_id,
     )
     with ROUTE_CACHE_LOCK:
         ROUTE_CACHE[cache_key] = {
             "schema_version": ROUTE_CACHE_SCHEMA_VERSION,
             "stored_at": time.time(),
             "score_version": score_version,
-            "response": response,
+            "response": deepcopy(response),
         }
         ROUTE_CACHE.move_to_end(cache_key)
         while len(ROUTE_CACHE) > ROUTE_CACHE_MAX_ENTRIES:
@@ -785,27 +846,21 @@ def simplify_city_graph(city: str, graph):
 
 
 def load_or_fetch_graph(city: str):
+    """Read the data-service-owned graph; never fetch or rewrite shared GraphML."""
     city_slug = normalize_city(city)
     cache_path = graph_cache_path(city_slug)
-    GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if cache_path.exists():
-        print("[graph] Loading Bangalore graph (cached: yes)")
-        graph = ensure_connected_graph(ox.load_graphml(cache_path))
-        ox.save_graphml(graph, cache_path)
-        return graph
-
-    print("[graph] Loading Bangalore graph (cached: no)")
-    graph = ox.graph_from_place(
-        place_query(city_slug),
-        network_type="drive",
-        simplify=False,
-        retain_all=False,
-        truncate_by_edge=True,
-    )
-    graph = simplify_city_graph(city_slug, graph)
-    ox.save_graphml(graph, cache_path)
-    print(f"[graph] Saved Bangalore graph cache to {cache_path}")
+    try:
+        before = cache_path.stat()
+    except FileNotFoundError as exc:
+        raise GraphNotPublishedError(
+            f"Data service has not published the {city_slug} graph"
+        ) from exc
+    graph = ensure_connected_graph(ox.load_graphml(cache_path))
+    after = cache_path.stat()
+    revision = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if revision != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise OSError("Shared graph changed while loading; retrying a complete publication")
+    graph.graph["_routing_graph_revision"] = revision
     return graph
 
 
@@ -1082,7 +1137,7 @@ def haversine_meters_vectorized(xp, latitudes, longitudes, target_lat: float, ta
 
 
 def fallback_edge_weight(edge_data: dict[str, Any]) -> float:
-    return max(float(edge_data.get("length", 50.0)) / 30.0, 0.001)
+    return edge_travel_time_seconds(edge_data)
 
 
 def multiedge_weight_lookup(weights_cpu: np.ndarray):
@@ -1400,20 +1455,52 @@ def precompute_vehicle_graph(
     )
 
 
+def score_snapshot_id(graph: Any, updated_at: float) -> str:
+    """Reuse persisted routes only for the same graph publication and scores."""
+    revision = graph.graph.get("_routing_graph_revision")
+    if revision is None:
+        # Injected/in-memory graphs lack a trustworthy persistent identity.
+        return uuid4().hex
+    digest = hashlib.blake2b(digest_size=20)
+    digest.update(json.dumps([revision, updated_at]).encode("utf-8"))
+    edge_data = sorted(
+        (data for _, _, _, data in graph.edges(keys=True, data=True)),
+        key=lambda data: str(data["segment_id"]),
+    )
+    for data in edge_data:
+        digest.update(json.dumps([
+            data["segment_id"], data["connectivity_score"], data["provenance_source"],
+        ], separators=(",", ":")).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def graph_publication_is_current(state: GraphState) -> bool:
+    revision = state.base_graph.graph.get("_routing_graph_revision")
+    if revision is None:
+        return True
+    try:
+        current = graph_cache_path(state.city).stat()
+    except OSError:
+        return False
+    return revision == (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
+
+
 def build_graph_state(city: str) -> GraphState:
     global ACTIVE_CITY
 
     city_slug = normalize_city(city)
     now = time.time()
     cached_state = GRAPH_CACHE.get(city_slug)
-    if cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs:
+    if (cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs
+            and graph_publication_is_current(cached_state)):
         ACTIVE_CITY = city_slug
         return cached_state
 
     with CITY_LOCKS[city_slug]:
         now = time.time()
         cached_state = GRAPH_CACHE.get(city_slug)
-        if cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs:
+        if (cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs
+                and graph_publication_is_current(cached_state)):
             ACTIVE_CITY = city_slug
             return cached_state
 
@@ -1443,6 +1530,7 @@ def build_graph_state(city: str) -> GraphState:
             edge_count=graph.number_of_edges(),
             node_index=node_index,
             vehicle_graphs=vehicle_graphs,
+            snapshot_id=score_snapshot_id(graph, updated_at),
         )
         ACTIVE_CITY = city_slug
         GRAPH_CACHE[city_slug] = state
@@ -1469,6 +1557,7 @@ def graph_is_ready(city: str) -> bool:
         and state is not None
         and state.expires_at > time.time()
         and state.vehicle_graphs
+        and graph_publication_is_current(state)
     )
 
 
@@ -1487,80 +1576,87 @@ def require_graph_state(city: str) -> GraphState:
     raise HTTPException(status_code=503, detail="Graph not loaded")
 
 
-def rebuild_vehicle_graphs(city: str, updated_at: float) -> None:
-    state = GRAPH_CACHE.get(city)
-    if state is None:
-        return
-
+def rebuild_vehicle_graphs(
+    state: GraphState,
+    scores: dict[str, float],
+    updated_at: float,
+    edge_sources: dict[str, str],
+) -> None:
     try:
-        risk_hour = city_local_hour(city)
-        new_graphs = {
-            vehicle: precompute_vehicle_graph(
-                city,
-                state.base_graph,
-                vehicle,
-                updated_at,
-                hour=risk_hour,
-            )
-            for vehicle in VEHICLE_PROFILES
-        }
+        # Serialize score and time-bucket writers. Existing routes keep references
+        # to the previous graph and arrays while we prepare their replacements.
         with state.lock:
+            if updated_at <= state.scores_updated_at and state.scores_updated_at > 0:
+                return
+            new_base_graph = state.base_graph.copy()
+            apply_scores_to_base_graph(new_base_graph, scores, edge_sources)
+            risk_hour = city_local_hour(state.city)
+            new_graphs = {
+                vehicle: precompute_vehicle_graph(
+                    state.city, new_base_graph, vehicle, updated_at, hour=risk_hour,
+                )
+                for vehicle in VEHICLE_PROFILES
+            }
+            snapshot_id = score_snapshot_id(new_base_graph, updated_at)
+            state.base_graph = new_base_graph
             state.vehicle_graphs = new_graphs
             state.scores_updated_at = updated_at
-            state.score_refreshing = False
-        print(f"[weights] refreshed precomputed weights for {city}")
+            state.snapshot_id = snapshot_id
+        print(f"[weights] refreshed precomputed weights for {state.city}")
     except Exception as exc:
+        print(f"[weights] failed to recompute {state.city}: {exc}")
+    finally:
         with state.lock:
             state.score_refreshing = False
-        print(f"[weights] failed to recompute {city}: {exc}")
 
 
-def ensure_current_risk_weights(state: GraphState) -> None:
-    required_hour = city_local_hour(state.city)
-    required_bucket = "night" if is_night_hour(required_hour) else "day"
-    if state.vehicle_graphs and all(
-        prepared.risk_time_bucket == required_bucket
-        for prepared in state.vehicle_graphs.values()
-    ):
-        return
-
+def ensure_current_risk_weights(state: GraphState) -> RouteSnapshot:
     with state.lock:
-        if state.vehicle_graphs and all(
-            prepared.risk_time_bucket == required_bucket
+        required_hour = city_local_hour(state.city)
+        required_bucket = "night" if is_night_hour(required_hour) else "day"
+        if not state.vehicle_graphs or any(
+            prepared.risk_time_bucket != required_bucket
             for prepared in state.vehicle_graphs.values()
         ):
-            return
-        state.vehicle_graphs = {
-            vehicle: precompute_vehicle_graph(
-                state.city,
-                state.base_graph,
-                vehicle,
-                state.scores_updated_at,
-                hour=required_hour,
-            )
-            for vehicle in VEHICLE_PROFILES
-        }
-    print(f"[weights] refreshed {state.city} risk weights for {required_bucket}")
+            state.vehicle_graphs = {
+                vehicle: precompute_vehicle_graph(
+                    state.city, state.base_graph, vehicle, state.scores_updated_at,
+                    hour=required_hour,
+                )
+                for vehicle in VEHICLE_PROFILES
+            }
+            print(f"[weights] refreshed {state.city} risk weights for {required_bucket}")
+        return RouteSnapshot(
+            base_graph=state.base_graph,
+            node_index=state.node_index,
+            vehicle_graphs=state.vehicle_graphs,
+            scores_updated_at=state.scores_updated_at,
+            snapshot_id=state.snapshot_id,
+        )
 
 
 def refresh_scores_for_city(city: str) -> None:
     state = GRAPH_CACHE.get(city)
-    if state is None or GRAPH_STATUS.get(city) != "ready":
-        return
-
-    scores, updated_at, edge_sources = safe_fetch_city_scores(city)
-    if not scores:
-        return
-    if updated_at <= state.scores_updated_at and state.scores_updated_at > 0:
+    if (state is None or GRAPH_STATUS.get(city) != "ready"
+            or not graph_publication_is_current(state)):
         return
 
     with state.lock:
         if state.score_refreshing:
             return
-        apply_scores_to_base_graph(state.base_graph, scores, edge_sources)
         state.score_refreshing = True
 
-    THREAD_POOL.submit(rebuild_vehicle_graphs, city, updated_at)
+    submitted = False
+    try:
+        scores, updated_at, edge_sources = safe_fetch_city_scores(city)
+        if not scores or not graph_publication_is_current(state):
+            return
+        THREAD_POOL.submit(rebuild_vehicle_graphs, state, scores, updated_at, edge_sources)
+        submitted = True
+    finally:
+        if not submitted:
+            with state.lock:
+                state.score_refreshing = False
 
 
 def score_refresh_loop() -> None:
@@ -1585,15 +1681,37 @@ async def preload_city_graph(city: str) -> None:
     GRAPH_STATUS[city_slug] = "loading"
     GRAPH_ERRORS.pop(city_slug, None)
 
-    try:
-        await asyncio.to_thread(request_data_service_preload, city_slug)
-        await asyncio.to_thread(build_graph_state, city_slug)
-        GRAPH_STATUS[city_slug] = "ready"
-        print(f"[graph] {city_slug} ready")
-    except Exception as exc:
-        GRAPH_STATUS[city_slug] = "error"
-        GRAPH_ERRORS[city_slug] = str(exc)
-        print(f"[graph] {city_slug} failed to load: {exc}")
+    # A retry cycle stays loading, including its bounded backoff. Only exhaustion
+    # or a nontransient failure publishes the terminal graph_unavailable state.
+    publication_deadline = time.monotonic() + GRAPH_PUBLICATION_WAIT_SECONDS
+    attempt = 0
+    await asyncio.to_thread(request_data_service_preload, city_slug)
+    while True:
+        try:
+            await asyncio.to_thread(build_graph_state, city_slug)
+            GRAPH_STATUS[city_slug] = "ready"
+            GRAPH_ERRORS.pop(city_slug, None)
+            print(f"[graph] {city_slug} ready")
+            return
+        except Exception as exc:
+            if isinstance(exc, GraphNotPublishedError):
+                remaining = publication_deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(GRAPH_LOAD_RETRY_SECONDS, remaining))
+                    continue
+                # Waiting for the owning service is distinct from retrying a
+                # failed read. Do not turn a normal cold start into a 15s error.
+                transient = False
+            else:
+                transient = isinstance(exc, (OSError, error.URLError))
+            if transient and attempt + 1 < GRAPH_LOAD_MAX_ATTEMPTS:
+                await asyncio.sleep(GRAPH_LOAD_RETRY_SECONDS * (2 ** attempt))
+                attempt += 1
+                continue
+            GRAPH_STATUS[city_slug] = "error"
+            GRAPH_ERRORS[city_slug] = str(exc)
+            print(f"[graph] {city_slug} failed to load: {exc}")
+            return
 
 
 def validate_point(name: str, point: list[float]) -> tuple[float, float]:
@@ -1976,38 +2094,53 @@ def compute_scalar_route_cost(
 def compute_route(city: str, origin: tuple[float, float], destination: tuple[float, float], mode: str, vehicle: str) -> dict[str, Any]:
     city_slug = normalize_city(city)
     state = require_graph_state(city_slug)
-    ensure_current_risk_weights(state)
-
-    prepared = state.vehicle_graphs.get(vehicle)
+    snapshot = ensure_current_risk_weights(state)
+    prepared = snapshot.vehicle_graphs.get(vehicle)
     if prepared is None:
         raise HTTPException(status_code=503, detail="Vehicle graph unavailable")
+    flight_key = (city_slug, origin, destination, mode, vehicle,
+                  snapshot.snapshot_id, prepared.risk_time_bucket)
+    with ROUTE_FLIGHTS_LOCK:
+        future = ROUTE_FLIGHTS.get(flight_key)
+        owner = future is None
+        if owner:
+            future = Future()
+            ROUTE_FLIGHTS[flight_key] = future
+    if not owner:
+        return deepcopy(future.result())
+    try:
+        response = compute_route_from_snapshot(city_slug, origin, destination, mode, vehicle, snapshot)
+        future.set_result(response)
+        return deepcopy(response)
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with ROUTE_FLIGHTS_LOCK:
+            ROUTE_FLIGHTS.pop(flight_key, None)
 
+
+def compute_route_from_snapshot(
+    city_slug: str, origin: tuple[float, float], destination: tuple[float, float],
+    mode: str, vehicle: str, snapshot: RouteSnapshot,
+) -> dict[str, Any]:
+    prepared = snapshot.vehicle_graphs[vehicle]
     cached_response = get_cached_route(
         city_slug,
         origin,
         destination,
         mode,
         vehicle,
-        max(state.scores_updated_at, prepared.source_scores_updated_at),
+        snapshot.scores_updated_at,
         prepared.risk_time_bucket,
+        snapshot.snapshot_id,
     )
     if cached_response is not None:
         return cached_response
 
-    graph = state.base_graph
+    graph = snapshot.base_graph
     weight_array = weight_array_for_mode(prepared, mode)
     weights_cpu = to_numpy_array(weight_array).astype(np.float32, copy=False)
-    missing_weights = sum(
-        1
-        for _, _, _, data in graph.edges(keys=True, data=True)
-        if "composite_cost" not in data
-    )
-    if missing_weights > 0:
-        print(f"[routing] WARNING: {missing_weights} edges missing composite_cost")
-        for _, _, _, data in graph.edges(keys=True, data=True):
-            if "composite_cost" not in data:
-                data["composite_cost"] = fallback_edge_weight(data)
-
     corridor_edge_coords, corridor_edge_lookup = corridor_edge_inputs(graph, origin, destination)
     (
         corridor_scores,
@@ -2049,8 +2182,8 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
     else:
         signal_source = PROVENANCE_ML_SYNTHETIC
 
-    origin_node = find_nearest_node(graph, origin[0], origin[1], state.node_index)
-    destination_node = find_nearest_node(graph, destination[0], destination[1], state.node_index)
+    origin_node = find_nearest_node(graph, origin[0], origin[1], snapshot.node_index)
+    destination_node = find_nearest_node(graph, destination[0], destination[1], snapshot.node_index)
 
     try:
         path_nodes = compute_path_with_fallbacks(graph, origin_node, destination_node, weights_cpu)
@@ -2280,9 +2413,10 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
         destination,
         mode,
         vehicle,
-        max(state.scores_updated_at, prepared.source_scores_updated_at),
+        snapshot.scores_updated_at,
         response,
         prepared.risk_time_bucket,
+        snapshot.snapshot_id,
     )
     return response
 
@@ -2301,7 +2435,7 @@ async def compute_all_routes(
     return await asyncio.gather(*tasks)
 
 
-def schedule_preload(city: str) -> str:
+def schedule_preload(city: str, *, retry_failed: bool = False) -> str:
     city_slug = normalize_city(city)
     if graph_is_ready(city_slug):
         return "ready"
@@ -2309,6 +2443,8 @@ def schedule_preload(city: str) -> str:
     current_task = PRELOAD_TASKS.get(city_slug)
     if current_task is not None and not current_task.done():
         return "already loading"
+    if GRAPH_STATUS.get(city_slug) == "error" and not retry_failed:
+        return "error"
 
     GRAPH_STATUS[city_slug] = "loading"
     PRELOAD_TASKS[city_slug] = asyncio.create_task(preload_city_graph(city_slug))
@@ -2324,7 +2460,6 @@ async def startup_event() -> None:
     configure_cpu_affinity()
     load_route_cache()
     APP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for city in supported_cities():
         GRAPH_STATUS[city] = "idle"
     default_city_slug = default_city()
@@ -2344,15 +2479,7 @@ def shutdown_event() -> None:
     THREAD_POOL.shutdown(wait=False, cancel_futures=True)
 
 
-@app.post("/route")
-async def route(request_model: RouteRequest):
-    try:
-        city_slug = normalize_city(request_model.city)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-    origin = validate_point("origin", request_model.origin)
-    destination = validate_point("destination", request_model.destination)
+def graph_loading_response(city_slug: str) -> JSONResponse | None:
     status = GRAPH_STATUS.get(city_slug, "idle")
     if status not in {"loading", "error"} and not graph_is_ready(city_slug):
         schedule_preload(city_slug)
@@ -2377,9 +2504,44 @@ async def route(request_model: RouteRequest):
                 "message": GRAPH_ERRORS.get(city_slug, "Graph unavailable"),
             },
         )
+    return None
+
+
+@app.post("/route")
+async def route(request_model: RouteRequest):
+    try:
+        city_slug = normalize_city(request_model.city)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    origin = validate_point("origin", request_model.origin)
+    destination = validate_point("destination", request_model.destination)
+    loading_response = graph_loading_response(city_slug)
+    if loading_response is not None:
+        return loading_response
 
     try:
-        return compute_route(city_slug, origin, destination, request_model.mode, request_model.vehicle)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            THREAD_POOL, compute_route, city_slug, origin, destination,
+            request_model.mode, request_model.vehicle,
+        )
+    except HTTPException as exc:
+        # The graph may expire or be replaced while this request waits for a
+        # worker. Preserve the same loading contract as admission to /route.
+        if exc.status_code == 503:
+            loading_response = graph_loading_response(city_slug)
+            if loading_response is not None:
+                return loading_response
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "code": "graph_unavailable",
+                    "message": str(exc.detail),
+                },
+            )
+        raise
     finally:
         gc.collect()
         free_gpu_memory()
@@ -2388,7 +2550,7 @@ async def route(request_model: RouteRequest):
 @app.post("/preload/{city}")
 async def preload(city: str) -> dict[str, Any]:
     city_slug = normalize_city(city)
-    preload_status = schedule_preload(city_slug)
+    preload_status = schedule_preload(city_slug, retry_failed=True)
     return {"status": preload_status, "city": city_slug}
 
 

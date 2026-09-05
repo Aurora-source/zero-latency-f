@@ -70,6 +70,13 @@ Time-dependent Bangalore risk rules use India Standard Time. Precomputed routing
 weights and route-cache keys are separated into day/night buckets so a cached route
 cannot carry the previous bucket's risk costs across the boundary.
 
+Each calculation captures one graph, city-score/provenance version, vehicle weight
+set, and Bangalore day/night bucket. A calculation already in progress finishes
+using that snapshot even if scores or the time bucket change; the next calculation
+captures the current snapshot. Corridor overrides and their risk explanations use
+the captured bucket too. Concurrent equivalent calculations share their in-flight
+result, and equivalent corridor requests share tower fetching and scoring.
+
 ### Ready response
 
 HTTP 200 returns:
@@ -151,6 +158,21 @@ During Phase 1, clients also recognize the previous HTTP 503 payload only when i
 `status: "loading"`, `code: "graph_loading"`, or the exact legacy graph-loading
 message. Other 503 responses are terminal service errors and must not be retried as a
 warm-up response. Servers must emit the HTTP 202 contract after migration.
+
+Phase 2A keeps this response throughout bounded server retries, including backoff.
+Data and routing graph loaders allow three attempts for transient I/O/source
+failures, with waits of 5 and 10 seconds. A missing shared GraphML publication is
+handled separately by routing: it requests data-service preload once, then waits
+for publication for at most 10 minutes, polling at 5-second intervals. This covers
+cold data-service warm-up without issuing repeated preload or download requests.
+These are retry/wait budgets, not a deadline on a graph parse or score calculation.
+Readiness remains HTTP 503 until a complete state is available.
+
+An exhausted budget or a nontransient failure produces the terminal HTTP 503 below.
+Ordinary route requests do not reset that budget. An explicit
+`POST /preload/{city}` on the affected service starts a fresh bounded cycle; a
+request during an active preload reuses that work. A replaced shared graph or
+expired in-memory graph also enters the HTTP 202 loading flow on the next route.
 
 ### Error response
 
