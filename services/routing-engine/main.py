@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -45,7 +46,7 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 SCORE_REFRESH_SECONDS = 60
 ROUTE_CACHE_TTL_SECONDS = 10 * 60
 ROUTE_CACHE_MAX_ENTRIES = 200
-ROUTE_CACHE_SCHEMA_VERSION = 5
+ROUTE_CACHE_SCHEMA_VERSION = 6
 GRAPH_LOAD_MAX_ATTEMPTS = 3
 GRAPH_LOAD_RETRY_SECONDS = 5
 GRAPH_PUBLICATION_WAIT_SECONDS = 10 * 60
@@ -265,6 +266,20 @@ ROAD_SPEEDS_KPH = {
     "construction": 15.0,
     "unknown": 25.0,
 }
+# Planning speeds, not statutory limits or measured Bengaluru traffic speeds.
+VEHICLE_SPEED_CAPS_KPH = {"bike": 18.0, "scooter": 45.0, "car": 120.0, "truck": 80.0}
+VEHICLE_ACCESS_KEYS = {
+    "bike": ("bicycle", "vehicle", "access"),
+    "scooter": ("motorcycle", "motor_vehicle", "vehicle", "access"),
+    "car": ("motorcar", "motor_vehicle", "vehicle", "access"),
+    "truck": ("hgv", "motor_vehicle", "vehicle", "access"),
+}
+PUBLIC_ACCESS_VALUES = {"yes", "permissive", "designated", "official", "discouraged"}
+DIMENSION_RESTRICTIONS = ("maxweight", "maxaxleload", "maxheight", "maxwidth", "maxlength")
+NO_ROUTE_DETAIL = (
+    "No route found. The selected points may be in disconnected areas. "
+    "Try points closer to main roads."
+)
 TEST_ROUTE_COORDS: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
     "bangalore": ((12.9716, 77.5946), (12.9948, 77.6699)),
     "chennai": ((13.0827, 80.2707), (13.0569, 80.2425)),
@@ -792,30 +807,12 @@ def graph_cache_path(city: str) -> Path:
 
 
 def ensure_connected_graph(graph):
-    print("[graph] checking connectivity...")
-    total_nodes = graph.number_of_nodes()
-    total_edges = graph.number_of_edges()
-    print(f"[graph] nodes: {total_nodes}, edges: {total_edges}")
-    if total_nodes == 0:
+    """Validate topology without removing one-way branches or small components."""
+    if graph.number_of_nodes() == 0:
         raise RuntimeError("Loaded graph has no nodes")
-
-    if graph.is_directed():
-        largest_component = max(nx.strongly_connected_components(graph), key=len)
-        component_name = "SCC"
-    else:
-        largest_component = max(nx.connected_components(graph), key=len)
-        component_name = "CC"
-
-    connected_graph = graph.subgraph(largest_component).copy()
-    kept_ratio = (len(largest_component) / max(total_nodes, 1)) * 100.0
-    print(
-        f"[graph] largest {component_name}: {connected_graph.number_of_nodes()} nodes "
-        f"({kept_ratio:.1f}% of graph)"
-    )
-    removed_nodes = total_nodes - connected_graph.number_of_nodes()
-    if removed_nodes > 0:
-        print(f"[graph] removed {removed_nodes} disconnected nodes")
-    return connected_graph
+    if not graph.is_directed():
+        raise ValueError("Routing requires a directed graph with represented travel directions")
+    return graph
 
 
 def simplify_city_graph(city: str, graph):
@@ -855,7 +852,9 @@ def load_or_fetch_graph(city: str):
         raise GraphNotPublishedError(
             f"Data service has not published the {city_slug} graph"
         ) from exc
-    graph = ensure_connected_graph(ox.load_graphml(cache_path))
+    graph = ensure_connected_graph(ox.load_graphml(
+        cache_path, edge_dtypes={"speed_kph": str, "travel_time": str},
+    ))
     after = cache_path.stat()
     revision = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     if revision != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
@@ -864,23 +863,164 @@ def load_or_fetch_graph(city: str):
     return graph
 
 
+def tag_values(value: Any) -> list[str]:
+    value = normalize_listish(value)
+    if isinstance(value, (list, tuple, set)):
+        return [part for item in value for part in tag_values(item)]
+    if value is None:
+        return []
+    if isinstance(value, bool):
+        return ["yes" if value else "no"]
+    return [part.strip().lower() for part in str(value).split(";") if part.strip()]
+
+
+def parsed_speed_kph(value: Any) -> float | None:
+    """Finite positive km/h; aggregated/list speeds use the lowest valid value."""
+    speeds = []
+    for part in tag_values(value):
+        match = re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)(?:e([+-]?\d+))?\s*(km/h|kmh|kph|mph|knots)?", part)
+        if match is None:
+            continue
+        number = match[1] + (f"e{match[2]}" if match[2] is not None else "")
+        speed = float(number) * {"mph": 1.609344, "knots": 1.852}.get(match[3], 1.0)
+        if math.isfinite(speed) and speed > 0:
+            speeds.append(speed)
+    return min(speeds) if speeds else None
+
+
 def normalize_speed_kph(raw_speed: Any, road_type: str) -> float:
-    raw_speed = normalize_listish(raw_speed)
-    if isinstance(raw_speed, list):
-        raw_speed = raw_speed[0] if raw_speed else None
-    if isinstance(raw_speed, str):
-        cleaned = raw_speed.replace("km/h", "").replace("kph", "").strip()
-        cleaned = cleaned.split(";", 1)[0].strip()
-        try:
-            return max(float(cleaned), 1.0)
-        except ValueError:
-            return ROAD_SPEEDS_KPH.get(road_type, ROAD_SPEEDS_KPH["unknown"])
-    if raw_speed is None:
-        return ROAD_SPEEDS_KPH.get(road_type, ROAD_SPEEDS_KPH["unknown"])
-    try:
-        return max(float(raw_speed), 1.0)
-    except (TypeError, ValueError):
-        return ROAD_SPEEDS_KPH.get(road_type, ROAD_SPEEDS_KPH["unknown"])
+    speed = parsed_speed_kph(raw_speed)
+    fallback_type = road_type.removesuffix("_link")
+    return speed if speed is not None else ROAD_SPEEDS_KPH.get(fallback_type, ROAD_SPEEDS_KPH["unknown"])
+
+
+def osm_travel_direction(data: dict[str, Any]) -> str | None:
+    """OSMnx reversed is relative to its normalized path, not always the OSM way.
+
+    Normalized oneway=True loses the original yes/-1 distinction. Directional
+    tags on that legacy representation are therefore ambiguous and fail closed.
+    """
+    reversed_values = set(tag_values(data.get("reversed")))
+    if reversed_values not in ({"yes"}, {"no"}):
+        return None
+    oneway = normalize_listish(data.get("oneway"))
+    if isinstance(oneway, bool) and oneway:
+        return None
+    values = set(tag_values(oneway))
+    if len(values) > 1:
+        return None
+    reverse_path = values in ({"-1"}, {"reverse"})
+    backward = (reversed_values == {"yes"}) != reverse_path
+    return "backward" if backward else "forward"
+
+
+def vehicle_speed_kph(data: dict[str, Any], vehicle: str = "car") -> float:
+    road_types = tag_values(data.get("highway") or data.get("road_type")) or ["unknown"]
+    direction = osm_travel_direction(data)
+    mode_key = VEHICLE_ACCESS_KEYS[vehicle][0]
+    limits = []
+    for base_key in ("maxspeed", f"maxspeed:{mode_key}"):
+        directional = data.get(f"{base_key}:{direction}") if direction else None
+        limit = parsed_speed_kph(directional)
+        if limit is None:
+            limit = parsed_speed_kph(data.get(base_key))
+        if limit is not None:
+            limits.append(limit)
+    speed = parsed_speed_kph(data.get("speed_kph"))
+    if speed is None:
+        speed = min(limits) if limits else min(normalize_speed_kph(None, road_type) for road_type in road_types)
+    return min(speed, VEHICLE_SPEED_CAPS_KPH[vehicle], *limits)
+
+
+def access_tags_allow(data: dict[str, Any], vehicle: str, direction: str | None = None) -> bool:
+    keys = VEHICLE_ACCESS_KEYS[vehicle]
+    # Permissions, purpose, dimensions and conditional rules are not in the
+    # request model. Do not assume the vehicle satisfies a represented limit.
+    if any(tag_values(data.get(f"{key}{suffix}")) for key in DIMENSION_RESTRICTIONS
+           for suffix in ("", ":conditional", ":forward", ":backward", ":forward:conditional", ":backward:conditional")):
+        return False
+    for key in keys:
+        if any(tag_values(data.get(f"{key}{suffix}:conditional"))
+               for suffix in ("", ":forward", ":backward")):
+            return False
+        if direction is None:
+            directional_values = [data.get(f"{key}:{side}") for side in ("forward", "backward")]
+            if any(tag_values(value) and not set(tag_values(value)) <= PUBLIC_ACCESS_VALUES
+                   for value in directional_values):
+                return False
+        else:
+            values = tag_values(data.get(f"{key}:{direction}"))
+            if values:
+                return set(values) <= PUBLIC_ACCESS_VALUES
+        values = tag_values(data.get(key))
+        if values:
+            return set(values) <= PUBLIC_ACCESS_VALUES
+    return True
+
+
+def vehicle_edge_allowed(data: dict[str, Any], vehicle: str) -> bool:
+    direction = osm_travel_direction(data)
+    if not access_tags_allow(data, vehicle, direction):
+        return False
+    keys = VEHICLE_ACCESS_KEYS[vehicle][:-1]
+    if any(tag_values(data.get(f"oneway:{key}:conditional")) for key in keys):
+        return False
+    if tag_values(data.get("oneway:conditional")):
+        return False
+    for key in (*[f"oneway:{key}" for key in keys], "oneway"):
+        value = data.get(key)
+        values = set(tag_values(value))
+        if not values:
+            continue
+        if values <= {"no", "0", "false"}:
+            break
+        if key == "oneway" and isinstance(value, bool):
+            # OSMnx already directed this edge, including original oneway=-1.
+            if set(tag_values(data.get("reversed"))) == {"yes"}:
+                return False
+            break
+        if values <= {"yes", "1", "true"}:
+            if direction != "forward":
+                return False
+        elif values <= {"-1", "reverse"}:
+            if direction != "backward":
+                return False
+        else:
+            return False
+        break
+    mode_key = VEHICLE_ACCESS_KEYS[vehicle][0]
+    # Unevaluated conditional speed limits and ambiguous directional limits must
+    # not silently become a faster unrestricted edge.
+    for key in ("maxspeed", f"maxspeed:{mode_key}"):
+        if any(tag_values(data.get(f"{key}{suffix}:conditional"))
+               for suffix in ("", ":forward", ":backward")):
+            return False
+        if direction is None and any(tag_values(data.get(f"{key}:{side}")) for side in ("forward", "backward")):
+            return False
+    road_types = set(tag_values(data.get("highway") or data.get("road_type")))
+    explicit_mode_access = set(tag_values(data.get(mode_key)))
+    mode_permitted = bool(explicit_mode_access) and explicit_mode_access <= PUBLIC_ACCESS_VALUES
+    if road_types & {"construction", "proposed", "abandoned", "steps"}:
+        return False
+    if not mode_permitted:
+        if vehicle == "bike" and (road_types & {"motorway", "motorway_link"}
+                                   or "yes" in tag_values(data.get("motorroad"))):
+            return False
+        if vehicle != "bike" and road_types & {"cycleway", "footway", "path", "pedestrian", "bridleway"}:
+            return False
+    return True
+
+
+def vehicle_node_allowed(data: dict[str, Any], vehicle: str) -> bool:
+    if not access_tags_allow(data, vehicle):
+        return False
+    barriers = set(tag_values(data.get("barrier"))) - {"no"}
+    if barriers:
+        # No gate state/clearance is supplied. Explicit mode permission is needed.
+        mode_key = VEHICLE_ACCESS_KEYS[vehicle][0]
+        permission = set(tag_values(data.get(mode_key)))
+        return bool(permission) and permission <= PUBLIC_ACCESS_VALUES
+    return True
 
 
 def fetch_city_scores(
@@ -929,27 +1069,20 @@ def safe_fetch_city_scores(
         return {}, 0.0, {}
 
 
-def edge_travel_time_seconds(data: dict[str, Any]) -> float:
+def edge_travel_time_seconds(data: dict[str, Any], vehicle: str = "car") -> float:
     try:
-        length = float(data.get("length", 50.0) or 50.0)
-    except (TypeError, ValueError):
-        length = 50.0
+        length = float(data.get("length"))
+    except (TypeError, ValueError, OverflowError):
+        return math.inf
     if not math.isfinite(length) or length <= 0:
-        length = 50.0
-    road_type = str(data.get("road_type") or normalize_highway(data.get("highway")))
-    speed_kph = normalize_speed_kph(data.get("speed_kph"), road_type)
-    speed_mps = max(speed_kph * (1000.0 / 3600.0), 1.0)
-    try:
-        travel_time = float(data.get("travel_time", 0.0) or 0.0)
-    except (TypeError, ValueError):
-        travel_time = 0.0
-    if not math.isfinite(travel_time) or travel_time <= 0:
-        travel_time = length / speed_mps
-    return max(travel_time, 0.001)
+        return math.inf
+    # Graph travel_time may be stale or car-specific. Recompute for this vehicle.
+    return length * 3.6 / vehicle_speed_kph(data, vehicle)
 
 
 def annotate_base_graph(graph):
-    graph = add_edge_speeds_and_times(graph)
+    # Do not overwrite edge speeds with OSMnx's city-wide imputation. The same
+    # explicit vehicle speed policy drives preparation, corridor overrides and ETA.
     travel_times: list[float] = []
 
     for edge_index, (u, v, key, data) in enumerate(graph.edges(keys=True, data=True)):
@@ -957,17 +1090,15 @@ def annotate_base_graph(graph):
         lat, lon = midpoint_lat_lon(geometry)
         road_type = normalize_highway(data.get("highway"))
         try:
-            length = float(data.get("length") or 1.0)
+            length = float(data.get("length"))
         except (TypeError, ValueError):
-            length = 1.0
+            length = math.nan
         if not math.isfinite(length) or length <= 0:
-            length = 1.0
-        speed_kph = normalize_speed_kph(data.get("speed_kph"), road_type)
+            length = math.nan
         normalized_time_data = {
             **data,
             "length": length,
             "road_type": road_type,
-            "speed_kph": speed_kph,
         }
         travel_time = edge_travel_time_seconds(normalized_time_data)
         data["edge_index"] = edge_index
@@ -981,15 +1112,16 @@ def annotate_base_graph(graph):
         data["travel_time"] = travel_time
         data["connectivity_score"] = float(data.get("connectivity_score") or 0.5)
         data["provenance_source"] = PROVENANCE_ML_SYNTHETIC
-        data["speed_kph"] = speed_kph
         data["composite_cost"] = float(data.get("composite_cost", travel_time))
-        travel_times.append(travel_time)
+        if math.isfinite(travel_time):
+            travel_times.append(travel_time)
 
     min_time = min(travel_times) if travel_times else 0.0
     max_time = max(travel_times) if travel_times else 1.0
     spread = max(max_time - min_time, 1e-9)
     for _, _, _, data in graph.edges(keys=True, data=True):
-        data["travel_time_norm"] = (float(data["travel_time"]) - min_time) / spread
+        seconds = float(data["travel_time"])
+        data["travel_time_norm"] = (seconds - min_time) / spread if math.isfinite(seconds) else 1.0
 
     return graph
 
@@ -1137,29 +1269,34 @@ def haversine_meters_vectorized(xp, latitudes, longitudes, target_lat: float, ta
 
 
 def fallback_edge_weight(edge_data: dict[str, Any]) -> float:
+    """Legacy time-estimate helper; unindexed routing edges never use this."""
     return edge_travel_time_seconds(edge_data)
 
 
 def multiedge_weight_lookup(weights_cpu: np.ndarray):
-    def weight(_: Any, __: Any, edge_data: dict[str, Any]) -> float:
-        if "edge_index" in edge_data:
-            edge_index = edge_data.get("edge_index")
-            if isinstance(edge_index, int) and 0 <= edge_index < len(weights_cpu):
-                return float(weights_cpu[edge_index])
-            return fallback_edge_weight(edge_data)
-
-        best_weight: float | None = None
-        for attrs in edge_data.values():
-            edge_index = attrs.get("edge_index")
-            if isinstance(edge_index, int) and 0 <= edge_index < len(weights_cpu):
-                candidate = float(weights_cpu[edge_index])
-            else:
-                candidate = fallback_edge_weight(attrs)
-            if best_weight is None or candidate < best_weight:
-                best_weight = candidate
-        return best_weight if best_weight is not None else 1.0
+    def weight(_: Any, __: Any, edge_data: dict[str, Any]) -> float | None:
+        selected = select_weighted_edge(edge_data, weights_cpu)
+        # NetworkX Dijkstra interprets None as a hidden edge, unlike infinity
+        # which can still produce an all-prohibited path.
+        return selected[2] if selected is not None else None
 
     return weight
+
+
+def select_weighted_edge(edges: dict[Any, dict[str, Any]], weights_cpu: np.ndarray):
+    selected = None
+    for key, attrs in edges.items():
+        index = attrs.get("edge_index")
+        if isinstance(index, bool) or not isinstance(index, (int, np.integer)):
+            continue
+        if not 0 <= index < len(weights_cpu):
+            continue
+        cost = float(weights_cpu[index])
+        if not math.isfinite(cost) or cost <= 0:
+            continue
+        if selected is None or cost < selected[2]:
+            selected = (key, attrs, cost)
+    return selected
 
 
 def shortest_path_nodes(graph, origin_node, destination_node, weights_cpu: np.ndarray):
@@ -1171,25 +1308,7 @@ def shortest_path_nodes(graph, origin_node, destination_node, weights_cpu: np.nd
     )
 
 
-def astar_path_nodes(graph, origin_node, destination_node, weights_cpu: np.ndarray):
-    def heuristic(node_a: Any, node_b: Any) -> float:
-        return haversine_meters(
-            float(graph.nodes[node_a]["y"]),
-            float(graph.nodes[node_a]["x"]),
-            float(graph.nodes[node_b]["y"]),
-            float(graph.nodes[node_b]["x"]),
-        ) / 33.33
-
-    return nx.astar_path(
-        graph,
-        origin_node,
-        destination_node,
-        heuristic=heuristic,
-        weight=multiedge_weight_lookup(weights_cpu),
-    )
-
-
-def validate_path(graph, path_nodes: list[Any]) -> None:
+def validate_path(graph, path_nodes: list[Any], weights_cpu: np.ndarray | None = None) -> None:
     if len(path_nodes) < 2:
         raise ValueError("Path must contain at least two nodes")
 
@@ -1200,6 +1319,8 @@ def validate_path(graph, path_nodes: list[Any]) -> None:
     for start, end in zip(path_nodes, path_nodes[1:]):
         if graph.get_edge_data(start, end) is None:
             raise ValueError(f"Path discontinuity between nodes {start} and {end}")
+        if weights_cpu is not None:
+            resolve_edge(graph, start, end, weights_cpu)
 
 
 def compute_path_with_fallbacks(
@@ -1208,53 +1329,15 @@ def compute_path_with_fallbacks(
     destination_node: Any,
     weights_cpu: np.ndarray,
 ) -> list[Any]:
-    path_attempts = [
-        (
-            "weighted dijkstra",
-            lambda: shortest_path_nodes(graph, origin_node, destination_node, weights_cpu),
-        ),
-        (
-            "reverse weighted dijkstra",
-            lambda: list(reversed(shortest_path_nodes(graph, destination_node, origin_node, weights_cpu))),
-        ),
-        (
-            "unweighted shortest path",
-            lambda: nx.shortest_path(graph, origin_node, destination_node, weight=None),
-        ),
-        (
-            "A* path",
-            lambda: astar_path_nodes(graph, origin_node, destination_node, weights_cpu),
-        ),
-    ]
-
-    last_error: Exception | None = None
-    for label, resolver in path_attempts:
-        try:
-            path_nodes = resolver()
-            validate_path(graph, path_nodes)
-            if label != "weighted dijkstra":
-                print(f"[routing] fallback pathfinder succeeded via {label}")
-            return path_nodes
-        except nx.NetworkXNoPath as exc:
-            last_error = exc
-            print(f"[routing] {label} failed: no path")
-        except Exception as exc:
-            last_error = exc
-            print(f"[routing] {label} failed: {type(exc).__name__}: {exc}")
-
-    print(f"[routing] No path found: {origin_node} -> {destination_node}")
-    print(f"[routing] Graph nodes: {graph.number_of_nodes()}")
-    print(f"[routing] Origin in graph: {origin_node in graph.nodes}")
-    print(f"[routing] Dest in graph: {destination_node in graph.nodes}")
-    if last_error is not None:
-        print(f"[routing] Last routing error: {type(last_error).__name__}: {last_error}")
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            "No route found. The selected points may be in disconnected areas. "
-            "Try points closer to main roads."
-        ),
-    )
+    # Never reverse a route or drop its weights to manufacture a successful path.
+    if origin_node == destination_node:
+        raise HTTPException(status_code=422, detail=NO_ROUTE_DETAIL)
+    try:
+        path_nodes = shortest_path_nodes(graph, origin_node, destination_node, weights_cpu)
+        validate_path(graph, path_nodes, weights_cpu)
+        return path_nodes
+    except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
+        raise HTTPException(status_code=422, detail=NO_ROUTE_DETAIL) from exc
 
 
 def precompute_vehicle_graph(
@@ -1293,18 +1376,21 @@ def precompute_vehicle_graph(
         )
 
     edge_count = len(edge_rows)
-    lengths_np = np.asarray([float(data.get("length", 50.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     travel_times_np = np.asarray(
-        [edge_travel_time_seconds(data) for _, _, _, data in edge_rows],
-        dtype=np.float32,
+        [edge_travel_time_seconds(data, vehicle) for _, _, _, data in edge_rows],
+        dtype=np.float64,
     )
-    travel_norms = np.asarray([float(data.get("travel_time_norm", 0.0)) for _, _, _, data in edge_rows], dtype=np.float32)
+    allowed_np = np.asarray([
+        vehicle_edge_allowed(data, vehicle)
+        and vehicle_node_allowed(base_graph.nodes[u], vehicle)
+        and vehicle_node_allowed(base_graph.nodes[v], vehicle)
+        for u, v, _, data in edge_rows
+    ], dtype=bool) & np.isfinite(travel_times_np)
     scores_np = np.clip(
         np.asarray([float(data.get("connectivity_score", 0.5)) for _, _, _, data in edge_rows], dtype=np.float32),
         0.0,
         1.0,
     )
-    speed_kph_np = np.asarray([float(data.get("speed_kph", 25.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     latitudes_np = np.asarray([float(data.get("mid_lat", 0.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     longitudes_np = np.asarray([float(data.get("mid_lon", 0.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     road_types = np.asarray([str(data.get("road_type", "unknown")) for _, _, _, data in edge_rows], dtype=object)
@@ -1320,15 +1406,13 @@ def precompute_vehicle_graph(
 
     def compute_cost_arrays(use_gpu: bool) -> dict[str, Any]:
         xp = array_backend(use_gpu)
-        lengths = xp.asarray(lengths_np, dtype=xp.float32)
-        travel_times = xp.asarray(travel_times_np, dtype=xp.float32)
+        allowed = xp.asarray(allowed_np, dtype=xp.bool_)
+        # Use harmless values for prohibited edges during intermediate arithmetic;
+        # their final costs are infinity in every mode.
+        time_cost = xp.asarray(np.where(allowed_np, travel_times_np, 1.0), dtype=xp.float64)
         scores = xp.clip(xp.asarray(scores_np, dtype=xp.float32), 0.0, 1.0)
-        speed_kph = xp.asarray(speed_kph_np, dtype=xp.float32)
         latitudes = xp.asarray(latitudes_np, dtype=xp.float32)
         longitudes = xp.asarray(longitudes_np, dtype=xp.float32)
-
-        speed_mps = xp.maximum(speed_kph * (1000.0 / 3600.0), 1.0)
-        time_cost = xp.where(travel_times > 0, travel_times, lengths / speed_mps).astype(xp.float32)
 
         base_multipliers = xp.ones(edge_count, dtype=xp.float32)
         risk_points = xp.zeros(edge_count, dtype=xp.float32)
@@ -1398,13 +1482,16 @@ def precompute_vehicle_graph(
             + float(profile["connectivity"]) * (1.0 - scores) * time_cost
             + float(profile["risk"]) * combined_multiplier * time_cost
         ).astype(xp.float32)
-        fastest_cost = xp.maximum(time_cost, 0.001).astype(xp.float32)
+        fastest_cost = time_cost
         balanced_cost = xp.maximum(composite_cost, 0.001).astype(xp.float32)
         connected_cost = xp.where(
             scores > 0.35,
             balanced_cost + (1.0 - scores) * time_cost * 0.75 + (combined_multiplier - 1.0) * time_cost,
             1e12,
         ).astype(xp.float32)
+        fastest_cost = xp.where(allowed, fastest_cost, xp.inf)
+        balanced_cost = xp.where(allowed, balanced_cost, xp.inf)
+        connected_cost = xp.where(allowed, connected_cost, xp.inf)
 
         return {
             "scores": scores,
@@ -1722,16 +1809,10 @@ def validate_point(name: str, point: list[float]) -> tuple[float, float]:
 
 def resolve_edge(graph, u: int, v: int, weights_cpu: np.ndarray):
     edges = graph.get_edge_data(u, v)
-    if not edges:
-        raise HTTPException(status_code=500, detail=f"Edge data missing between nodes {u} and {v}.")
-    return min(
-        edges.items(),
-        key=lambda item: (
-            float(weights_cpu[item[1]["edge_index"]])
-            if isinstance(item[1].get("edge_index"), int) and item[1]["edge_index"] < len(weights_cpu)
-            else fallback_edge_weight(item[1])
-        ),
-    )
+    selected = select_weighted_edge(edges or {}, weights_cpu)
+    if selected is None:
+        raise HTTPException(status_code=422, detail=NO_ROUTE_DETAIL)
+    return selected[0], selected[1]
 
 
 def serialize_node(node: Any) -> Any:
@@ -2016,8 +2097,8 @@ def push_corridor_scores_to_tiles(
         print(f"[tiles] corridor feedback skipped for {city}: {exc}")
 
 
-def edge_time_cost(data: dict[str, Any]) -> float:
-    return edge_travel_time_seconds(data)
+def edge_time_cost(data: dict[str, Any], vehicle: str = "car") -> float:
+    return edge_travel_time_seconds(data, vehicle)
 
 
 def compute_scalar_route_cost(
@@ -2032,7 +2113,10 @@ def compute_scalar_route_cost(
     profile = VEHICLE_PROFILES[vehicle]
     current_hour = city_local_hour(city) if hour is None else hour
     risk_profile = base_risk_profile(city, data, current_hour, score_override=score)
-    time_cost = edge_time_cost(data)
+    time_cost = edge_time_cost(data, vehicle)
+    allowed = vehicle_edge_allowed(data, vehicle) and math.isfinite(time_cost)
+    if not allowed:
+        time_cost = 1.0
 
     vehicle_multiplier = 1.0
     reasons = list(risk_profile["reasons"])
@@ -2081,7 +2165,7 @@ def compute_scalar_route_cost(
     if stable_penalty:
         risk_points = min(1.0, risk_points + 0.25)
 
-    return float(max(cost, 0.001)), {
+    return (float(cost if mode == "fastest" else max(cost, 0.001)) if allowed else math.inf), {
         "score": float(max(0.0, min(1.0, score))),
         "risk_points": risk_points,
         "risk_level": risk_level_for_values(score, risk_points),
@@ -2140,7 +2224,7 @@ def compute_route_from_snapshot(
 
     graph = snapshot.base_graph
     weight_array = weight_array_for_mode(prepared, mode)
-    weights_cpu = to_numpy_array(weight_array).astype(np.float32, copy=False)
+    weights_cpu = to_numpy_array(weight_array).astype(np.float64, copy=False)
     corridor_edge_coords, corridor_edge_lookup = corridor_edge_inputs(graph, origin, destination)
     (
         corridor_scores,
@@ -2156,9 +2240,11 @@ def compute_route_from_snapshot(
     )
     corridor_risk_details: dict[int, dict[str, Any]] = {}
     if corridor_scores:
-        weights_cpu = np.array(weights_cpu, dtype=np.float32, copy=True)
+        weights_cpu = np.array(weights_cpu, dtype=np.float64, copy=True)
         current_hour = prepared.risk_hour
         for edge_index, data in corridor_edge_lookup.items():
+            if not 0 <= edge_index < len(weights_cpu) or not math.isfinite(weights_cpu[edge_index]):
+                continue
             segment_id = str(data.get("segment_id") or "")
             if not segment_id:
                 continue
@@ -2173,7 +2259,9 @@ def compute_route_from_snapshot(
                 float(score),
                 hour=current_hour,
             )
-            weights_cpu[edge_index] = np.float32(updated_weight)
+            # Connectivity changes the metrics for fastest, never its objective.
+            if mode != "fastest":
+                weights_cpu[edge_index] = updated_weight
             corridor_risk_details[edge_index] = risk_details
         print(
             f"[routing] applied corridor scores for {len(corridor_risk_details)} edges "
@@ -2187,7 +2275,7 @@ def compute_route_from_snapshot(
 
     try:
         path_nodes = compute_path_with_fallbacks(graph, origin_node, destination_node, weights_cpu)
-        validate_path(graph, path_nodes)
+        validate_path(graph, path_nodes, weights_cpu)
     except Exception as exc:
         if isinstance(exc, HTTPException):
             raise
@@ -2279,14 +2367,14 @@ def compute_route_from_snapshot(
         signal_segments.append(
             {
                 "segment_id": segment_id,
-                "coordinates": [[lat, lon] for lon, lat in oriented_coords],
+                "coordinates": [[lat, lon] for lon, lat in coords],
                 "score": round(score, 3),
                 "risk": risk_level,
                 "provenance_source": provenance_source,
             }
         )
 
-        edge_times.append(edge_time_cost(data))
+        edge_times.append(edge_time_cost(data, vehicle))
         if override_details:
             reasons = list(dict.fromkeys(str(reason) for reason in override_details["reasons"]))
             flood_label = override_details.get("flood_zone_label")
@@ -2317,7 +2405,7 @@ def compute_route_from_snapshot(
                 "surface_type": data.get("surface_type"),
                 "length": float(data.get("length", 1.0)),
                 "score": score,
-                "travel_time": edge_time_cost(data),
+                "travel_time": edge_time_cost(data, vehicle),
                 "travel_time_norm": float(data.get("travel_time_norm", 0.0)),
                 "risk_level": risk_level,
                 "risk_points": risk_points,
@@ -2365,10 +2453,7 @@ def compute_route_from_snapshot(
         )
         raise HTTPException(
             status_code=422,
-            detail=(
-                "No route found. The selected points may be in disconnected areas. "
-                "Try points closer to main roads."
-            ),
+            detail=NO_ROUTE_DETAIL,
         )
     explanation = build_explanation(city_slug, mode, vehicle, edge_snapshots, avg_connectivity)
     if route_score_payload:

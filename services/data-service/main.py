@@ -191,6 +191,28 @@ ox.settings.use_cache = True
 ox.settings.log_console = False
 ox.settings.cache_folder = str(OSMNX_HTTP_CACHE_DIR)
 
+# Preserve routing evidence on future graph downloads. Existing GraphML files
+# cannot acquire tags/topology that their original import discarded.
+ROUTING_ACCESS_TAGS = ("access", "vehicle", "motor_vehicle", "motorcar", "motorcycle", "bicycle", "hgv")
+ROUTING_WAY_TAGS = sorted({
+    "highway", "junction", "surface", "motorroad", "maxweight", "maxaxleload", "maxheight", "maxwidth", "maxlength",
+    *[f"{key}{direction}{condition}"
+      for key in ("maxweight", "maxaxleload", "maxheight", "maxwidth", "maxlength")
+      for direction in ("", ":forward", ":backward")
+      for condition in ("", ":conditional")],
+    *[f"{key}{direction}{condition}"
+      for key in (*ROUTING_ACCESS_TAGS, "maxspeed", "maxspeed:bicycle", "maxspeed:motorcycle", "maxspeed:motorcar", "maxspeed:hgv")
+      for direction in ("", ":forward", ":backward")
+      for condition in ("", ":conditional")],
+    *[f"oneway{mode}{condition}"
+      for mode in ("", ":vehicle", ":motor_vehicle", ":motorcar", ":motorcycle", ":bicycle", ":hgv")
+      for condition in ("", ":conditional")],
+})
+ox.settings.useful_tags_way = list(dict.fromkeys([*ox.settings.useful_tags_way, *ROUTING_WAY_TAGS]))
+ox.settings.useful_tags_node = list(dict.fromkeys([
+    *ox.settings.useful_tags_node, "barrier", *ROUTING_WAY_TAGS,
+]))
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1632,7 +1654,7 @@ def load_local_graph_fallback(city: str) -> Any | None:
         if not path.exists():
             continue
         print(f"[graph] local graph loaded from {path}")
-        return ox.load_graphml(path)
+        return ox.load_graphml(path, edge_dtypes={"speed_kph": str, "travel_time": str})
     return None
 
 
@@ -1882,7 +1904,7 @@ def publish_graph_cache(graph: Any, cache_path: Path) -> None:
 
 def simplify_city_graph(city: str, graph):
     try:
-        graph = ox.simplify_graph(graph)
+        graph = ox.simplify_graph(graph, edge_attrs_differ=ROUTING_WAY_TAGS)
     except Exception:
         pass
 
@@ -1909,7 +1931,7 @@ def load_or_fetch_graph(city: str):
 
     if cache_path.exists():
         print(f"[graph] Loading Bangalore graph (cached: yes)")
-        return ox.load_graphml(cache_path)
+        return ox.load_graphml(cache_path, edge_dtypes={"speed_kph": str, "travel_time": str})
 
     local_graph = load_local_graph_fallback(city_slug)
     if local_graph is not None:

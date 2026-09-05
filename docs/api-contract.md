@@ -66,6 +66,53 @@ The `OpenCelliD` spelling is a compatibility alias only.
 - `vehicle`: `scooter`, `bike`, `car`, or `truck`. Bicycle and scooter are distinct
   values and must not be collapsed by clients or services.
 
+Phase 2B1 interprets `bike` as a ridden bicycle, `scooter` as a motor scooter in
+the OSM `motorcycle` category, `car` as `motorcar`, and `truck` as `hgv`. It does
+not infer a stand-up scooter, moped, delivery exemption, or truck dimensions.
+
+`fastest` minimizes the sum of estimated travel seconds for the selected vehicle
+on permitted, represented directed edges. Connectivity and risk affect its
+reported metrics but never its route-selection cost. `balanced` and `connected`
+retain their existing penalty formulas, using the same vehicle travel times and
+access filtering. Low connectivity remains a cost penalty, not an access ban.
+
+Travel time is `length_metres * 3.6 / speed_kph`. A valid edge `speed_kph` is used
+as an estimate, constrained by parseable posted limits and the planning ceilings
+below. Without a valid estimate, a parseable posted limit is used; otherwise a
+documented road-class fallback applies. Cached graph `travel_time` is recalculated
+so a car-specific or stale value cannot become another vehicle's ETA.
+
+| Vehicle | Planning speed ceiling (km/h) |
+| --- | ---: |
+| `bike` | 18 |
+| `scooter` | 45 |
+| `car` | 120 |
+| `truck` | 80 |
+
+These are model assumptions, not verified Bengaluru speeds or statutory limits.
+Bare numeric speeds mean km/h; `km/h`, `kmh`, `kph`, `mph`, and `knots` are
+recognized. Zero, negative, boolean, nonfinite, or unparseable speeds are invalid.
+Aggregated/list values use the lowest parseable positive speed. Road fallbacks
+in km/h are motorway 90, trunk 70, primary 50, secondary 40, tertiary 30,
+residential 20, construction 15, and unknown/other 25; `_link` roads inherit the
+parent class. Vehicle ceilings and represented posted limits still constrain
+these values. Invalid/missing edge lengths exclude the edge rather than inventing
+a travel distance. Construction roads are excluded by the access policy.
+
+Access checks use the most specific represented vehicle permission before
+`motor_vehicle` (for motorized modes), `vehicle`, and `access`. Explicit private,
+prohibited, purpose-limited, or unsupported permissions are excluded when the
+request cannot establish eligibility. Directional rules require reliable OSM-way
+orientation. The router uses only existing graph directions, including for bicycle
+one-way exemptions; it never creates a missing reverse edge. Retained conditional
+rules, dimensions, barriers, and ambiguous direction metadata are handled
+conservatively as described in [the Phase 2B1 report](phase-2b1-routing.md).
+
+The graph is still sourced as a driving network. Missing cycling topology,
+discarded historical tags, turn restrictions, and local regulatory defaults are
+not established by this API. A successful route is not a claim of complete legal
+or physical suitability on the real Bengaluru map.
+
 Time-dependent Bangalore risk rules use India Standard Time. Precomputed routing
 weights and route-cache keys are separated into day/night buckets so a cached route
 cannot carry the previous bucket's risk costs across the boundary.
@@ -131,6 +178,14 @@ real and estimated edges. Each `signal_segments` entry carries its own
 `provenance_source`, so clients do not need to infer per-edge provenance from the
 aggregate value.
 
+The same selected parallel edge supplies route cost, ETA, geometry, and
+connectivity/provenance. Equal-cost parallel edges use the same stable insertion
+order tie-break throughout. `total_time_min` sums unrounded selected-vehicle edge
+seconds and rounds the total to one decimal minute. It estimates moving time only;
+traffic, intersection waits, acceleration, gradients, and driving conditions are
+not modeled. Each `signal_segments` geometry includes both endpoints, even at joins
+where the aggregate `path_geojson` removes a duplicate coordinate.
+
 For migration only, readers accept `coverage_percent` or `real_data_percent` as aliases
 for `real_data_coverage_percent`. During Phase 1, services may emit those aliases in
 addition to the authoritative canonical field; new consumers must ignore them. The historic
@@ -175,6 +230,18 @@ request during an active preload reuses that work. A replaced shared graph or
 expired in-memory graph also enters the HTTP 202 loading flow on the next route.
 
 ### Error response
+
+Disconnected endpoints, no permitted directed path, or endpoints snapped to the
+same node return terminal HTTP 422 with the existing no-route payload:
+
+```json
+{"detail":"No route found. The selected points may be in disconnected areas. Try points closer to main roads."}
+```
+
+This response has no `Retry-After` header. The server does not reverse a path or
+retry unweighted routing to bypass restrictions or missing/invalid edge weights.
+Unexpected pathfinding failures remain server errors rather than being disguised
+as a successful fallback route.
 
 Validation errors use HTTP 422. Unsupported cities use HTTP 404. A graph that failed
 to load or another unavailable dependency uses HTTP 503 with a non-loading code:

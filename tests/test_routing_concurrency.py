@@ -730,7 +730,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
             replacement = target.parent / "replacement.graphml"
             replacement.write_bytes(b"a-different-complete-publication")
 
-            def replace_during_read(path):
+            def replace_during_read(path, **kwargs):
                 globals_dict["os"].replace(replacement, target)
                 return synthetic_graph()
 
@@ -878,15 +878,20 @@ class RoutingConcurrencyTests(unittest.TestCase):
         for vehicle in globals_dict["VEHICLE_PROFILES"]:
             with self.subTest(vehicle=vehicle, mode="fastest"):
                 fastest = results[("fastest", vehicle)]
-                self.assertEqual(fastest["nodes"], [1, 2, 4])
-                self.assertEqual(fastest["total_time_min"], 1.3)
-                self.assertEqual(fastest["provenance_source"], "ml_synthetic")
+                # Phase 2B1 caps each vehicle's planning speed. Bike/scooter now
+                # prefer the 1200m branch; car/truck use the 2000m faster branch.
+                short_branch = vehicle in {"bike", "scooter"}
+                self.assertEqual(fastest["nodes"], [1, 3, 4] if short_branch else [1, 2, 4])
+                self.assertEqual(fastest["total_time_min"], {
+                    "bike": 4.0, "scooter": 1.7, "car": 1.3, "truck": 1.5,
+                }[vehicle])
+                self.assertEqual(fastest["provenance_source"], "trai" if short_branch else "ml_synthetic")
                 self.assertEqual(len(fastest["path_geojson"]["coordinates"]), 3)
             for mode in ("balanced", "connected"):
                 with self.subTest(vehicle=vehicle, mode=mode):
                     covered = results[(mode, vehicle)]
                     self.assertEqual(covered["nodes"], [1, 3, 4])
-                    self.assertEqual(covered["total_time_min"], 1.7)
+                    self.assertEqual(covered["total_time_min"], 4.0 if vehicle == "bike" else 1.7)
                     self.assertEqual(covered["provenance_source"], "trai")
                     self.assertEqual(
                         covered["path_geojson"]["coordinates"],
