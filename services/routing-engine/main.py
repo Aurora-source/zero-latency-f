@@ -46,7 +46,7 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 SCORE_REFRESH_SECONDS = 60
 ROUTE_CACHE_TTL_SECONDS = 10 * 60
 ROUTE_CACHE_MAX_ENTRIES = 200
-ROUTE_CACHE_SCHEMA_VERSION = 6
+ROUTE_CACHE_SCHEMA_VERSION = 7
 GRAPH_LOAD_MAX_ATTEMPTS = 3
 GRAPH_LOAD_RETRY_SECONDS = 5
 GRAPH_PUBLICATION_WAIT_SECONDS = 10 * 60
@@ -177,6 +177,8 @@ class GraphState:
     lock: Lock = field(default_factory=Lock)
     score_refreshing: bool = False
     snapshot_id: str = field(default_factory=lambda: uuid4().hex)
+    graph_revision: str = ""
+    score_revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -188,10 +190,23 @@ class RouteSnapshot:
     vehicle_graphs: dict[str, PreparedVehicleGraph]
     scores_updated_at: float
     snapshot_id: str
+    graph_revision: str = ""
+    score_revision: str = ""
 
 
 class GraphNotPublishedError(FileNotFoundError):
     """Data service has not yet atomically published the shared city graph."""
+
+
+class RevisionCompatibilityError(OSError):
+    """Retry a graph/score mismatch within the existing bounded load budget."""
+
+
+def require_revision(payload: dict[str, Any], name: str) -> str:
+    revision = payload.get(name)
+    if not isinstance(revision, str) or not revision.strip():
+        raise RevisionCompatibilityError(f"Missing or invalid {name}")
+    return revision
 
 
 STRATEGY_FACTORS: dict[str, dict[str, float]] = {
@@ -437,7 +452,7 @@ def load_route_cache() -> None:
     with ROUTE_CACHE_LOCK:
         ROUTE_CACHE.clear()
         for cache_key, entry in payload.items():
-            if isinstance(entry, dict):
+            if isinstance(entry, dict) and entry.get("schema_version") == ROUTE_CACHE_SCHEMA_VERSION:
                 ROUTE_CACHE[str(cache_key)] = entry
 
 
@@ -478,6 +493,7 @@ def route_cache_key(
     vehicle: str,
     risk_time_bucket: str | None = None,
     snapshot_id: str = "",
+    corridor_score_revision: str = "",
 ) -> str:
     return json.dumps(
         {
@@ -488,6 +504,7 @@ def route_cache_key(
             "vehicle": vehicle,
             "risk_time_bucket": risk_time_bucket or city_risk_time_bucket(city),
             "snapshot_id": snapshot_id,
+            "corridor_score_revision": corridor_score_revision,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -503,6 +520,7 @@ def get_cached_route(
     score_version: float,
     risk_time_bucket: str | None = None,
     snapshot_id: str = "",
+    corridor_score_revision: str = "",
 ) -> dict[str, Any] | None:
     cache_key = route_cache_key(
         city,
@@ -512,6 +530,7 @@ def get_cached_route(
         vehicle,
         risk_time_bucket,
         snapshot_id,
+        corridor_score_revision,
     )
     now = time.time()
     with ROUTE_CACHE_LOCK:
@@ -553,6 +572,7 @@ def store_cached_route(
     response: dict[str, Any],
     risk_time_bucket: str | None = None,
     snapshot_id: str = "",
+    corridor_score_revision: str = "",
 ) -> None:
     cache_key = route_cache_key(
         city,
@@ -562,6 +582,7 @@ def store_cached_route(
         vehicle,
         risk_time_bucket,
         snapshot_id,
+        corridor_score_revision,
     )
     with ROUTE_CACHE_LOCK:
         ROUTE_CACHE[cache_key] = {
@@ -859,6 +880,10 @@ def load_or_fetch_graph(city: str):
     revision = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
     if revision != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
         raise OSError("Shared graph changed while loading; retrying a complete publication")
+    # Only the data service may assign/adopt a durable graph identity. Legacy
+    # GraphML waits for that publisher to migrate it; routing never rewrites it.
+    require_revision(graph.graph, "graph_revision")
+    # This process-local stat tuple only detects replacement; it is not identity.
     graph.graph["_routing_graph_revision"] = revision
     return graph
 
@@ -1025,16 +1050,24 @@ def vehicle_node_allowed(data: dict[str, Any], vehicle: str) -> bool:
 
 def fetch_city_scores(
     city: str,
-) -> tuple[dict[str, float], float, dict[str, str]]:
+    graph_revision: str,
+) -> tuple[dict[str, float], float, dict[str, str], str]:
     score_request = request.Request(f"{data_service_url()}/scores/{city}", method="GET")
     with request.urlopen(score_request, timeout=60) as response:
         payload = json.loads(response.read().decode("utf-8"))
 
+    if require_revision(payload, "graph_revision") != graph_revision:
+        raise RevisionCompatibilityError("City scores belong to a different graph revision")
+    score_revision = require_revision(payload, "score_revision")
     raw_scores = payload.get("scores", {})
     if not isinstance(raw_scores, dict):
         raise ValueError("Data service returned a non-object scores payload")
     updated_at = float(payload.get("updated_at", 0.0) or 0.0)
     scores = {str(key): float(value) for key, value in raw_scores.items()}
+    if not math.isfinite(updated_at) or any(
+        not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in scores.values()
+    ):
+        raise ValueError("Data service returned invalid scores or update time")
     raw_edge_sources = payload.get("edge_sources", {})
     aggregate_source = canonical_provenance(
         payload.get("provenance_source") or payload.get("source")
@@ -1056,17 +1089,21 @@ def fetch_city_scores(
             if edge_source == PROVENANCE_HYBRID
             else edge_source
         )
-    return scores, updated_at, edge_sources
+    return scores, updated_at, edge_sources, score_revision
 
 
 def safe_fetch_city_scores(
     city: str,
-) -> tuple[dict[str, float], float, dict[str, str]]:
+    graph_revision: str,
+) -> tuple[dict[str, float], float, dict[str, str], str]:
     try:
-        return fetch_city_scores(city)
+        return fetch_city_scores(city, graph_revision)
+    except RevisionCompatibilityError:
+        # A successful but incompatible response must not become a ready state.
+        raise
     except (TimeoutError, error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"[scores] failed to fetch {city}: {exc}")
-        return {}, 0.0, {}
+        return {}, 0.0, {}, "unavailable"
 
 
 def edge_travel_time_seconds(data: dict[str, Any], vehicle: str = "car") -> float:
@@ -1110,7 +1147,8 @@ def annotate_base_graph(graph):
         data["mid_lon"] = lon
         data["length"] = length
         data["travel_time"] = travel_time
-        data["connectivity_score"] = float(data.get("connectivity_score") or 0.5)
+        # GraphML is topology, not a verified score publication.
+        data["connectivity_score"] = 0.5
         data["provenance_source"] = PROVENANCE_ML_SYNTHETIC
         data["composite_cost"] = float(data.get("composite_cost", travel_time))
         if math.isfinite(travel_time):
@@ -1542,23 +1580,13 @@ def precompute_vehicle_graph(
     )
 
 
-def score_snapshot_id(graph: Any, updated_at: float) -> str:
-    """Reuse persisted routes only for the same graph publication and scores."""
-    revision = graph.graph.get("_routing_graph_revision")
-    if revision is None:
-        # Injected/in-memory graphs lack a trustworthy persistent identity.
-        return uuid4().hex
-    digest = hashlib.blake2b(digest_size=20)
-    digest.update(json.dumps([revision, updated_at]).encode("utf-8"))
-    edge_data = sorted(
-        (data for _, _, _, data in graph.edges(keys=True, data=True)),
-        key=lambda data: str(data["segment_id"]),
-    )
-    for data in edge_data:
-        digest.update(json.dumps([
-            data["segment_id"], data["connectivity_score"], data["provenance_source"],
-        ], separators=(",", ":")).encode("utf-8"))
-    return digest.hexdigest()
+def score_snapshot_id(graph: Any, score_revision: str) -> str:
+    """A constant-size identity; no graph/score-array hash on route admission."""
+    graph_revision = require_revision(graph.graph, "graph_revision")
+    require_revision({"score_revision": score_revision}, "score_revision")
+    return hashlib.blake2b(
+        json.dumps([graph_revision, score_revision]).encode("utf-8"), digest_size=20,
+    ).hexdigest()
 
 
 def graph_publication_is_current(state: GraphState) -> bool:
@@ -1593,9 +1621,9 @@ def build_graph_state(city: str) -> GraphState:
 
         graph = load_or_fetch_graph(city_slug)
         graph = annotate_base_graph(graph)
-        scores, updated_at, edge_sources = safe_fetch_city_scores(city_slug)
-        if scores:
-            apply_scores_to_base_graph(graph, scores, edge_sources)
+        graph_revision = require_revision(graph.graph, "graph_revision")
+        scores, updated_at, edge_sources, score_revision = safe_fetch_city_scores(city_slug, graph_revision)
+        apply_scores_to_base_graph(graph, scores, edge_sources)
 
         node_index = build_node_index(graph)
         risk_hour = city_local_hour(city_slug)
@@ -1617,8 +1645,12 @@ def build_graph_state(city: str) -> GraphState:
             edge_count=graph.number_of_edges(),
             node_index=node_index,
             vehicle_graphs=vehicle_graphs,
-            snapshot_id=score_snapshot_id(graph, updated_at),
+            snapshot_id=score_snapshot_id(graph, score_revision),
+            graph_revision=graph_revision,
+            score_revision=score_revision,
         )
+        if not graph_publication_is_current(state):
+            raise RevisionCompatibilityError("Graph replaced while preparing its score snapshot")
         ACTIVE_CITY = city_slug
         GRAPH_CACHE[city_slug] = state
         if USE_CUPY:
@@ -1668,13 +1700,21 @@ def rebuild_vehicle_graphs(
     scores: dict[str, float],
     updated_at: float,
     edge_sources: dict[str, str],
+    graph_revision: str,
+    score_revision: str,
+    expected_score_revision: str,
 ) -> None:
     try:
         # Serialize score and time-bucket writers. Existing routes keep references
         # to the previous graph and arrays while we prepare their replacements.
-        with state.lock:
-            if updated_at <= state.scores_updated_at and state.scores_updated_at > 0:
+        with CITY_LOCKS[state.city], state.lock:
+            if (GRAPH_CACHE.get(state.city) is not state
+                    or not graph_publication_is_current(state)
+                    or graph_revision != state.graph_revision
+                    or expected_score_revision != state.score_revision
+                    or score_revision == state.score_revision):
                 return
+            require_revision({"score_revision": score_revision}, "score_revision")
             new_base_graph = state.base_graph.copy()
             apply_scores_to_base_graph(new_base_graph, scores, edge_sources)
             risk_hour = city_local_hour(state.city)
@@ -1684,11 +1724,14 @@ def rebuild_vehicle_graphs(
                 )
                 for vehicle in VEHICLE_PROFILES
             }
-            snapshot_id = score_snapshot_id(new_base_graph, updated_at)
+            snapshot_id = score_snapshot_id(new_base_graph, score_revision)
+            if not graph_publication_is_current(state):
+                return
             state.base_graph = new_base_graph
             state.vehicle_graphs = new_graphs
             state.scores_updated_at = updated_at
             state.snapshot_id = snapshot_id
+            state.score_revision = score_revision
         print(f"[weights] refreshed precomputed weights for {state.city}")
     except Exception as exc:
         print(f"[weights] failed to recompute {state.city}: {exc}")
@@ -1719,6 +1762,8 @@ def ensure_current_risk_weights(state: GraphState) -> RouteSnapshot:
             vehicle_graphs=state.vehicle_graphs,
             scores_updated_at=state.scores_updated_at,
             snapshot_id=state.snapshot_id,
+            graph_revision=state.graph_revision,
+            score_revision=state.score_revision,
         )
 
 
@@ -1732,14 +1777,24 @@ def refresh_scores_for_city(city: str) -> None:
         if state.score_refreshing:
             return
         state.score_refreshing = True
+        graph_revision = state.graph_revision
+        expected_score_revision = state.score_revision
 
     submitted = False
     try:
-        scores, updated_at, edge_sources = safe_fetch_city_scores(city)
-        if not scores or not graph_publication_is_current(state):
+        scores, updated_at, edge_sources, score_revision = safe_fetch_city_scores(city, graph_revision)
+        if (score_revision == "unavailable" or GRAPH_CACHE.get(city) is not state
+                or not graph_publication_is_current(state)):
             return
-        THREAD_POOL.submit(rebuild_vehicle_graphs, state, scores, updated_at, edge_sources)
+        THREAD_POOL.submit(
+            rebuild_vehicle_graphs, state, scores, updated_at, edge_sources,
+            graph_revision, score_revision, expected_score_revision,
+        )
         submitted = True
+    except RevisionCompatibilityError as exc:
+        # Keep the last compatible snapshot. The ordinary periodic refresh is
+        # single-flight; there is no nested/unbounded mismatch retry loop.
+        print(f"[scores] rejected incompatible refresh for {city}: {exc}")
     finally:
         if not submitted:
             with state.lock:
@@ -1985,9 +2040,12 @@ def fetch_corridor_scores(
     origin: tuple[float, float],
     destination: tuple[float, float],
     edge_coords: dict[str, list[float]],
-) -> tuple[dict[str, float], str, int, float, float, dict[str, str]]:
+    city: str,
+    graph_revision: str,
+    score_revision: str,
+) -> tuple[dict[str, float], str, int, float, float, dict[str, str], str | None]:
     if not edge_coords:
-        return {}, PROVENANCE_ML_SYNTHETIC, 0, 0.0, 0.0, {}
+        return {}, PROVENANCE_ML_SYNTHETIC, 0, 0.0, 0.0, {}, "empty"
 
     padding_km = get_corridor_padding(origin, destination)
     corridor_request = request.Request(
@@ -1998,6 +2056,9 @@ def fetch_corridor_scores(
                 "destination": [destination[0], destination[1]],
                 "edge_coords": edge_coords,
                 "padding_km": padding_km,
+                "city": city,
+                "graph_revision": graph_revision,
+                "score_revision": score_revision,
             }
         ).encode("utf-8"),
         headers={"Content-Type": "application/json"},
@@ -2006,8 +2067,12 @@ def fetch_corridor_scores(
     try:
         with request.urlopen(corridor_request, timeout=60) as response:
             payload = json.loads(response.read().decode("utf-8"))
+        if (require_revision(payload, "graph_revision") != graph_revision
+                or require_revision(payload, "base_score_revision") != score_revision):
+            raise RevisionCompatibilityError("Corridor scores do not match the request snapshot")
+        corridor_score_revision = require_revision(payload, "score_revision")
     except Exception as exc:
-        print(f"[routing] corridor score fetch failed, using ML estimate: {exc}")
+        print(f"[routing] corridor scores unavailable; retaining compatible city scores: {exc}")
         return (
             {},
             PROVENANCE_ML_SYNTHETIC,
@@ -2015,6 +2080,7 @@ def fetch_corridor_scores(
             0.0,
             0.0,
             {segment_id: PROVENANCE_ML_SYNTHETIC for segment_id in edge_coords},
+            None,
         )
 
     raw_scores = payload.get("scores", {})
@@ -2026,7 +2092,9 @@ def fetch_corridor_scores(
         if segment_key not in edge_coords:
             continue
         try:
-            scores[segment_key] = max(0.0, min(1.0, float(score)))
+            numeric_score = float(score)
+            if math.isfinite(numeric_score):
+                scores[segment_key] = max(0.0, min(1.0, numeric_score))
         except (TypeError, ValueError):
             continue
 
@@ -2068,6 +2136,7 @@ def fetch_corridor_scores(
         ),
         first_payload_percentage(payload, "good_signal_percent"),
         edge_sources,
+        corridor_score_revision,
     )
 
 
@@ -2075,13 +2144,21 @@ def push_corridor_scores_to_tiles(
     city: str,
     route_scores: dict[str, float],
     edge_sources: dict[str, str],
+    graph_revision: str,
+    base_score_revision: str,
+    score_revision: str,
 ) -> None:
     if not route_scores:
         return
     feedback_request = request.Request(
         f"{data_service_url()}/corridor-feedback/{city}",
         data=json.dumps(
-            {"scores": route_scores, "edge_sources": edge_sources}
+            {
+                "scores": route_scores, "edge_sources": edge_sources,
+                "graph_revision": graph_revision,
+                "base_score_revision": base_score_revision,
+                "score_revision": score_revision,
+            }
         ).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -2209,19 +2286,6 @@ def compute_route_from_snapshot(
     mode: str, vehicle: str, snapshot: RouteSnapshot,
 ) -> dict[str, Any]:
     prepared = snapshot.vehicle_graphs[vehicle]
-    cached_response = get_cached_route(
-        city_slug,
-        origin,
-        destination,
-        mode,
-        vehicle,
-        snapshot.scores_updated_at,
-        prepared.risk_time_bucket,
-        snapshot.snapshot_id,
-    )
-    if cached_response is not None:
-        return cached_response
-
     graph = snapshot.base_graph
     weight_array = weight_array_for_mode(prepared, mode)
     weights_cpu = to_numpy_array(weight_array).astype(np.float64, copy=False)
@@ -2233,11 +2297,26 @@ def compute_route_from_snapshot(
         corridor_real_data_coverage,
         corridor_good_signal_percent,
         corridor_edge_sources,
+        corridor_score_revision,
     ) = fetch_corridor_scores(
         origin,
         destination,
         corridor_edge_coords,
+        city_slug,
+        snapshot.graph_revision,
+        snapshot.score_revision,
     )
+    # Corridor observations can change without a city-wide score publication.
+    # Validate their revision before cache lookup. Unavailable/mismatched replies
+    # fall back to this request's city snapshot and are never cached as coverage.
+    if corridor_score_revision is not None:
+        cached_response = get_cached_route(
+            city_slug, origin, destination, mode, vehicle,
+            snapshot.scores_updated_at, prepared.risk_time_bucket,
+            snapshot.snapshot_id, corridor_score_revision,
+        )
+        if cached_response is not None:
+            return cached_response
     corridor_risk_details: dict[int, dict[str, Any]] = {}
     if corridor_scores:
         weights_cpu = np.array(weights_cpu, dtype=np.float64, copy=True)
@@ -2456,14 +2535,20 @@ def compute_route_from_snapshot(
             detail=NO_ROUTE_DETAIL,
         )
     explanation = build_explanation(city_slug, mode, vehicle, edge_snapshots, avg_connectivity)
-    if route_score_payload:
+    if route_score_payload and corridor_score_revision is not None:
         push_corridor_scores_to_tiles(
             city_slug,
             route_score_payload,
             route_score_sources,
+            snapshot.graph_revision,
+            snapshot.score_revision,
+            corridor_score_revision,
         )
 
     response = {
+        "graph_revision": snapshot.graph_revision,
+        "score_revision": snapshot.score_revision,
+        "corridor_score_revision": corridor_score_revision,
         "mode": mode,
         "vehicle": vehicle,
         "nodes": [serialize_node(node) for node in path_nodes],
@@ -2492,17 +2577,12 @@ def compute_route_from_snapshot(
         "corridor_good_signal_percent": corridor_good_signal_percent,
         "explanation": explanation,
     }
-    store_cached_route(
-        city_slug,
-        origin,
-        destination,
-        mode,
-        vehicle,
-        snapshot.scores_updated_at,
-        response,
-        prepared.risk_time_bucket,
-        snapshot.snapshot_id,
-    )
+    if corridor_score_revision is not None:
+        store_cached_route(
+            city_slug, origin, destination, mode, vehicle,
+            snapshot.scores_updated_at, response, prepared.risk_time_bucket,
+            snapshot.snapshot_id, corridor_score_revision,
+        )
     return response
 
 

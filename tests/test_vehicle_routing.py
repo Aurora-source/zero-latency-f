@@ -30,7 +30,7 @@ def routing(routing_module, monkeypatch):
         "GRAPH_CACHE": {}, "GRAPH_STATUS": {"bangalore": "ready"},
         "ROUTE_CACHE": OrderedDict(), "ROUTE_FLIGHTS": {},
         "city_local_hour": lambda city: 12,
-        "fetch_corridor_scores": lambda *args: ({}, "ml_synthetic", 0, 0, 0, {}),
+        "fetch_corridor_scores": lambda *args: ({}, "ml_synthetic", 0, 0, 0, {}, "corridor-test"),
         "push_corridor_scores_to_tiles": lambda *args: None,
         "persist_route_cache": lambda: None,
         "find_nearest_node": lambda graph, lat, lon, index: next(
@@ -44,7 +44,7 @@ def routing(routing_module, monkeypatch):
 
 
 def graph_with_nodes(count=4):
-    graph = nx.MultiDiGraph(crs="EPSG:4326")
+    graph = nx.MultiDiGraph(crs="EPSG:4326", graph_revision="graph-vehicle-test")
     for node in range(count):
         graph.add_node(node, x=77.50 + node * 0.001, y=12.90)
     return graph
@@ -70,6 +70,7 @@ def prepare(routing, graph):
     state = routing["GraphState"](
         city="bangalore", base_graph=annotated, expires_at=math.inf,
         scores_updated_at=1, vehicle_graphs=prepared,
+        graph_revision=annotated.graph["graph_revision"], score_revision="scores-test",
     )
     routing["GRAPH_CACHE"]["bangalore"] = state
     return state
@@ -120,6 +121,7 @@ def test_fastest_excludes_city_and_corridor_connectivity_penalties(routing, monk
     monkeypatch.setitem(routing, "fetch_corridor_scores", lambda *args: (
         {"0-3-0": 0.001, "0-1-0": 0.99, "1-3-0": 0.99}, "trai", 1, 100, 67,
         {edge: "trai" for edge in ("0-3-0", "0-1-0", "1-3-0")},
+        "corridor-test",
     ))
     result = route(routing, state, vehicle=vehicle)
     assert result["nodes"] == [0, 3]
@@ -147,6 +149,7 @@ def test_access_restrictions_survive_all_modes_and_corridor_overrides(routing, m
     state = prepare(routing, graph)
     monkeypatch.setitem(routing, "fetch_corridor_scores", lambda *args: (
         {"0-3-0": 1.0}, "trai", 1, 100, 100, {"0-3-0": "trai"},
+        "corridor-test",
     ))
     for mode in ("fastest", "balanced", "connected"):
         assert route(routing, state, mode=mode, vehicle=vehicle)["nodes"] == [0, 1, 3]

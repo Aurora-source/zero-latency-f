@@ -99,12 +99,14 @@ class SegmentPayload(BaseModel):
 class PredictRequest(BaseModel):
     city: str | None = None
     segments: list[SegmentPayload]
+    graph_revision: str | None = None
 
 
 class PredictResponse(BaseModel):
     scores: dict[str, float]
     data_source: str
     confidence: float
+    graph_revision: str | None = None
 
 
 def detect_system_gpu() -> None:
@@ -678,7 +680,10 @@ def startup_event() -> None:
 @app.post("/predict", response_model=PredictResponse)
 def predict_scores(request: PredictRequest) -> PredictResponse:
     if not request.segments:
-        return PredictResponse(scores={}, data_source=MODEL_SOURCE, confidence=MODEL_CONFIDENCE)
+        return PredictResponse(
+            scores={}, data_source=MODEL_SOURCE, confidence=MODEL_CONFIDENCE,
+            graph_revision=request.graph_revision,
+        )
 
     features = build_feature_matrix(request.segments, city=request.city)
     predictions = np.clip(predict_batch_gpu(features), 0.0, 1.0)
@@ -690,6 +695,9 @@ def predict_scores(request: PredictRequest) -> PredictResponse:
         },
         data_source=MODEL_SOURCE,
         confidence=MODEL_CONFIDENCE,
+        # Bind predictions to the caller's exact segment graph identity. The data
+        # service verifies it before publishing; no shared graph is read here.
+        graph_revision=request.graph_revision,
     )
 
 

@@ -41,7 +41,7 @@ def load_routing_service() -> dict[str, object]:
 def synthetic_graph(
     *, score: float = 0.2, provenance: str = "ml_synthetic"
 ) -> nx.MultiDiGraph:
-    graph = nx.MultiDiGraph(crs="EPSG:4326")
+    graph = nx.MultiDiGraph(crs="EPSG:4326", graph_revision="graph-test")
     graph.add_node(1, x=ORIGIN[1], y=ORIGIN[0])
     graph.add_node(2, x=DESTINATION[1], y=DESTINATION[0])
     graph.add_edge(
@@ -67,7 +67,7 @@ def synthetic_graph(
 
 
 def synthetic_diamond() -> nx.MultiDiGraph:
-    graph = nx.MultiDiGraph(crs="EPSG:4326")
+    graph = nx.MultiDiGraph(crs="EPSG:4326", graph_revision="graph-diamond")
     node_coords = {
         1: (77.590, 12.970),
         2: (77.595, 12.975),
@@ -162,6 +162,8 @@ def graph_state(
         node_index=None,
         vehicle_graphs={"car": prepared},
         snapshot_id=snapshot_id,
+        graph_revision=graph.graph["graph_revision"],
+        score_revision=f"scores-{score_version}",
     )
 
 
@@ -174,7 +176,7 @@ def route_runtime_patches(globals_dict: dict[str, object]) -> dict[str, object]:
             else 2
         ),
         "compute_path_with_fallbacks": lambda graph, origin, destination, weights: [1, 2],
-        "fetch_corridor_scores": lambda *args: ({}, "ml_synthetic", 0, 0.0, 0.0, {}),
+        "fetch_corridor_scores": lambda *args: ({}, "ml_synthetic", 0, 0.0, 0.0, {}, "corridor-test"),
         "push_corridor_scores_to_tiles": lambda *args: None,
         "persist_route_cache": lambda: None,
     }
@@ -395,7 +397,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
             if call_number == 1:
                 route_started.set()
                 self.assertTrue(release_old_route.wait(1.0))
-            return {}, "ml_synthetic", 0, 0.0, 0.0, {}
+            return {}, "ml_synthetic", 0, 0.0, 0.0, {}, "corridor-test"
 
         def fake_precompute(city, graph, vehicle, score_version, *, hour=None):
             return prepared_graph(
@@ -437,6 +439,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
                     {"1-2-0": 0.9},
                     2.0,
                     {"1-2-0": "trai"},
+                    state.graph_revision, "scores-2.0", state.score_revision,
                 )
                 new_snapshot_id = state.snapshot_id
                 self.assertNotEqual(new_snapshot_id, old_snapshot_id)
@@ -475,7 +478,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
         def fake_fetch(*args):
             route_started.set()
             self.assertTrue(release_route.wait(1.0))
-            return {"1-2-0": 0.8}, "trai", 1, 100.0, 100.0, {"1-2-0": "trai"}
+            return {"1-2-0": 0.8}, "trai", 1, 100.0, 100.0, {"1-2-0": "trai"}, "corridor-test"
 
         def fake_precompute(city, graph, vehicle, score_version, *, hour=None):
             return prepared_graph(
@@ -538,6 +541,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
         with patch.dict(
             globals_dict,
             {
+                "GRAPH_CACHE": {"bangalore": state},
                 "city_local_hour": lambda city: 12,
                 "precompute_vehicle_graph": (
                     lambda *args, **kwargs: (_ for _ in ()).throw(
@@ -551,6 +555,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
                 {"1-2-0": 0.95},
                 2.0,
                 {"1-2-0": "trai"},
+                state.graph_revision, "scores-2.0", state.score_revision,
             )
 
         self.assertIs(state.base_graph, old_graph)
@@ -571,15 +576,15 @@ class RoutingConcurrencyTests(unittest.TestCase):
         fetch_calls = 0
         submitted_jobs = 0
 
-        def slow_fetch(city):
+        def slow_fetch(city, graph_revision):
             nonlocal fetch_calls
             with calls_lock:
                 fetch_calls += 1
             fetch_started.set()
             self.assertTrue(release_fetch.wait(1.0))
-            return {"1-2-0": 0.8}, 2.0, {"1-2-0": "trai"}
+            return {"1-2-0": 0.8}, 2.0, {"1-2-0": "trai"}, "scores-2.0"
 
-        def fake_rebuild(candidate_state, scores, updated_at, edge_sources):
+        def fake_rebuild(candidate_state, scores, updated_at, edge_sources, *revisions):
             self.assertIs(candidate_state, state)
             with candidate_state.lock:
                 candidate_state.score_refreshing = False
@@ -668,7 +673,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
                 "VEHICLE_PROFILES": {"car": car_profile},
                 "load_or_fetch_graph": fake_load,
                 "annotate_base_graph": lambda candidate: candidate,
-                "safe_fetch_city_scores": lambda city: ({}, 1.0, {}),
+                "safe_fetch_city_scores": lambda *args: ({}, 1.0, {}, "scores-1.0"),
                 "build_node_index": lambda candidate: None,
                 "city_local_hour": lambda city: 12,
                 "precompute_vehicle_graph": (
@@ -803,7 +808,7 @@ class RoutingConcurrencyTests(unittest.TestCase):
                         "VEHICLE_PROFILES": {"car": car_profile},
                         "load_or_fetch_graph": load_new,
                         "annotate_base_graph": lambda candidate: candidate,
-                        "safe_fetch_city_scores": lambda city: ({}, 2.0, {}),
+                        "safe_fetch_city_scores": lambda *args: ({}, 2.0, {}, "scores-2.0"),
                         "build_node_index": lambda candidate: None,
                         "city_local_hour": lambda city: 12,
                         "precompute_vehicle_graph": (
@@ -1008,8 +1013,8 @@ class RoutingConcurrencyTests(unittest.TestCase):
         first.graph["_routing_graph_revision"] = revision
         second.graph["_routing_graph_revision"] = revision
 
-        baseline = score_snapshot_id(first, 10.0)
-        restart_generation = score_snapshot_id(second, 10.0)
+        baseline = score_snapshot_id(first, "scores-1")
+        restart_generation = score_snapshot_id(second, "scores-1")
         self.assertEqual(restart_generation, baseline)
 
         changed_score = synthetic_graph(score=0.8, provenance="trai")
@@ -1018,11 +1023,14 @@ class RoutingConcurrencyTests(unittest.TestCase):
         changed_provider.graph["_routing_graph_revision"] = revision
         changed_revision = synthetic_graph(score=0.7, provenance="trai")
         changed_revision.graph["_routing_graph_revision"] = (*revision[:-1], revision[-1] + 1)
+        changed_revision.graph["graph_revision"] = "graph-new"
 
-        changed_version_generation = score_snapshot_id(second, 11.0)
-        changed_score_generation = score_snapshot_id(changed_score, 10.0)
-        changed_provider_generation = score_snapshot_id(changed_provider, 10.0)
-        changed_revision_generation = score_snapshot_id(changed_revision, 10.0)
+        # The publisher rotates score identity for value/provenance changes;
+        # wall clocks and filesystem stat tuples no longer establish identity.
+        changed_version_generation = score_snapshot_id(second, "scores-2")
+        changed_score_generation = score_snapshot_id(changed_score, "scores-changed")
+        changed_provider_generation = score_snapshot_id(changed_provider, "provenance-changed")
+        changed_revision_generation = score_snapshot_id(changed_revision, "scores-1")
         self.assertNotEqual(changed_version_generation, baseline)
         self.assertNotEqual(changed_score_generation, baseline)
         self.assertNotEqual(changed_provider_generation, baseline)
@@ -1092,12 +1100,10 @@ class RoutingConcurrencyTests(unittest.TestCase):
                     )
                 )
 
-        # In-memory graphs have no durable file identity and therefore must not
-        # accidentally reuse a prior process's persisted route generation.
-        self.assertNotEqual(
-            score_snapshot_id(synthetic_graph(), 10.0),
-            score_snapshot_id(synthetic_graph(), 10.0),
-        )
+        unversioned = synthetic_graph()
+        del unversioned.graph["graph_revision"]
+        with self.assertRaises(self.routing["RevisionCompatibilityError"]):
+            score_snapshot_id(unversioned, "scores-1")
 
     def test_missing_graph_waits_for_data_service_publication_then_recovers(self) -> None:
         preload_city_graph = self.routing["preload_city_graph"]

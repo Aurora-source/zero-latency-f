@@ -247,6 +247,8 @@ class RoutingModeTests(unittest.TestCase):
         request_module = self.routing["request"]
         response_payload = {
             "scores": {"edge-real": 0.8},
+            "graph_revision": "graph-test", "base_score_revision": "scores-test",
+            "score_revision": "corridor-test",
             "source": "opencellid",
             "real_data_coverage_percent": 0.0,
             "coverage_percent": 99.0,
@@ -265,7 +267,7 @@ class RoutingModeTests(unittest.TestCase):
                 return json.dumps(response_payload).encode("utf-8")
 
         with patch.object(request_module, "urlopen", return_value=DummyResponse()):
-            scores, _source, _tower_count, real_coverage, _good, edge_sources = (
+            scores, _source, _tower_count, real_coverage, _good, edge_sources, _revision = (
                 fetch_corridor_scores(
                     (12.97, 77.59),
                     (12.99, 77.67),
@@ -273,6 +275,7 @@ class RoutingModeTests(unittest.TestCase):
                         "edge-real": [12.971, 77.591],
                         "edge-ml": [12.989, 77.669],
                     },
+                    "bangalore", "graph-test", "scores-test",
                 )
             )
 
@@ -286,6 +289,7 @@ class RoutingModeTests(unittest.TestCase):
         request_module = self.routing["request"]
         response_payload = {
             "scores": {"edge-real": 0.8, "edge-ml": 0.4},
+            "graph_revision": "graph-test", "score_revision": "scores-test",
             "source": "hybrid",
             "updated_at": 12.0,
             "edge_sources": {
@@ -306,7 +310,7 @@ class RoutingModeTests(unittest.TestCase):
                 return json.dumps(response_payload).encode("utf-8")
 
         with patch.object(request_module, "urlopen", return_value=DummyResponse()):
-            scores, updated_at, edge_sources = fetch_city_scores("bangalore")
+            scores, updated_at, edge_sources, _revision = fetch_city_scores("bangalore", "graph-test")
 
         self.assertEqual(scores, response_payload["scores"])
         self.assertEqual(updated_at, 12.0)
@@ -951,17 +955,13 @@ class BangaloreDefaultTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             score_dir = Path(tmpdir)
             with (score_dir / "bangalore_real_scores.pkl").open("wb") as handle:
-                pickle.dump({"edge-real": 0.4, "edge-fallback": 0.05}, handle)
-            (score_dir / "bangalore_real_scores_meta.json").write_text(
-                json.dumps(
-                    {
-                        "source": "OpenCelliD",
-                        "coverage_percent": 0.0,
-                    }
-                ),
-                encoding="utf-8",
-            )
+                pickle.dump({
+                    "graph_revision": "graph-test", "score_revision": "scores-test",
+                    "scores": {"edge-real": 0.4, "edge-fallback": 0.05},
+                    "metadata": {"source": "OpenCelliD", "coverage_percent": 0.0},
+                }, handle)
             state = SimpleNamespace(
+                graph_revision="graph-test",
                 segments=[object(), object()],
                 segment_lookup={"edge-real": 0, "edge-fallback": 1},
             )
@@ -992,6 +992,7 @@ class BangaloreDefaultTests(unittest.TestCase):
         original_graph_cache_dir = globals_dict["GRAPH_CACHE_DIR"]
         original_http_cache_dir = globals_dict["OSMNX_HTTP_CACHE_DIR"]
         attempts: list[tuple[str, float]] = []
+        candidate_graph = SimpleNamespace(graph={})
 
         def fake_graph_from_polygon(*args, **kwargs):
             attempts.append(
@@ -1002,7 +1003,7 @@ class BangaloreDefaultTests(unittest.TestCase):
             )
             if len(attempts) == 1:
                 raise TimeoutError("primary endpoint timed out")
-            return {"graph": "ok"}
+            return candidate_graph
 
         with tempfile.TemporaryDirectory() as tmpdir:
             globals_dict["GRAPH_CACHE_DIR"] = Path(tmpdir)
@@ -1029,7 +1030,8 @@ class BangaloreDefaultTests(unittest.TestCase):
                 globals_dict["GRAPH_CACHE_DIR"] = original_graph_cache_dir
                 globals_dict["OSMNX_HTTP_CACHE_DIR"] = original_http_cache_dir
 
-        self.assertEqual(graph, {"graph": "ok"})
+        self.assertIs(graph, candidate_graph)
+        self.assertTrue(graph.graph["graph_revision"])
         self.assertEqual(
             attempts,
             [
@@ -1355,12 +1357,16 @@ class BangaloreDefaultTests(unittest.TestCase):
             globals_dict,
             {
                 "fetch_towers_cached": fake_fetch,
+                "GRAPH_CACHE": {"bangalore": SimpleNamespace(
+                    graph_revision="graph-test", score_revision="scores-test",
+                )},
                 "compute_scores_from_towers": lambda edge_coords, towers: {
                     edge_id: 0.8 for edge_id in edge_coords
                 },
             },
         ):
             payload = payload_model(
+                city="bangalore", graph_revision="graph-test", score_revision="scores-test",
                 origin=[12.9716, 77.5946],
                 destination=[12.9948, 77.6699],
                 edge_coords={

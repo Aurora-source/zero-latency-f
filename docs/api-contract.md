@@ -124,6 +124,40 @@ captures the current snapshot. Corridor overrides and their risk explanations us
 the captured bucket too. Concurrent equivalent calculations share their in-flight
 result, and equivalent corridor requests share tower fetching and scoring.
 
+### Graph and score compatibility
+
+The data service is the sole publisher of shared GraphML. Every publication embeds
+a new opaque `graph_revision` inside the same atomically replaced file. Reloading
+that file preserves its identity. City names, node/edge counts, and filesystem
+timestamps are not revision identities; routing uses file stats only to detect a
+replacement cheaply. Published graphs are immutable.
+
+City score responses carry `graph_revision` and a separate opaque `score_revision`.
+The latter changes when score values, provenance, or associated metadata change,
+even if topology and `updated_at` stay unchanged. Revisions are compared for exact
+equality, not sorted by wall-clock time. Prediction requests carry the graph
+revision and the response must echo it before data accepts the result. The
+prediction endpoint still accepts standalone requests without a revision, but
+those responses cannot supply verified city scores.
+
+Route responses identify their captured `graph_revision`, city `score_revision`,
+and `corridor_score_revision` (null when no compatible corridor response was
+available). Score refresh publishes copied graph/weight/provenance state only if
+the target graph and expected previous score generation are still current. A late
+reply cannot update a replacement graph or overwrite a later score generation.
+
+Route-cache schema 7 accounts for graph and city-score identities, corridor-score
+identity, endpoints, vehicle, mode, and the captured day/night bucket. Corridor
+scores are checked before cache lookup because observations can change without a
+city-score update. Incompatible or unavailable corridor responses retain the
+request's compatible city scores; these fallback results are not cached and
+rejected overrides never contribute real-data coverage. City-score refresh is
+periodic (60 seconds), so compatibility does not imply immediate observation of
+every newer score publication.
+
+This protocol assumes one process per service. Process-local locks and atomic file
+replacement do not provide coordination for multiple publisher workers/replicas.
+
 ### Ready response
 
 HTTP 200 returns:
@@ -132,6 +166,9 @@ HTTP 200 returns:
 {
   "mode": "balanced",
   "vehicle": "bike",
+  "graph_revision": "graph-example",
+  "score_revision": "city-scores-example",
+  "corridor_score_revision": "corridor-scores-example",
   "path_geojson": {
     "type": "LineString",
     "coordinates": [[77.5946, 12.9716], [77.6699, 12.9948]]
@@ -229,6 +266,22 @@ Ordinary route requests do not reset that budget. An explicit
 request during an active preload reuses that work. A replaced shared graph or
 expired in-memory graph also enters the HTTP 202 loading flow on the next route.
 
+Phase 2B2 treats absent graph metadata and a successfully returned but absent or
+mismatched city-score revision as transient compatibility failures within the same
+three-attempt budget (5 and 10 seconds of backoff). They do not start unlimited
+retry cycles. Routing checks graph replacement again before publishing a ready
+snapshot. A normal city-score transport/parse failure retains the existing
+degraded behavior: a freshly loaded graph gets a uniform `0.5` synthetic base with
+`score_revision: "unavailable"`; embedded GraphML coverage is discarded. A failed
+periodic refresh retains the last compatible snapshot and makes no immediate retry.
+
+Only data may migrate a legacy GraphML without revision metadata: it atomically
+republishes the graph with an identity before using it. Routing stays read-only.
+Legacy or mismatched real-score files are ignored rather than relabeled as current
+coverage; an accepted persisted score file must contain graph/score identities,
+scores, and metadata together in one envelope. Separate legacy sidecars cannot
+prove compatibility. Route-cache entries from schemas before 7 are discarded.
+
 ### Error response
 
 Disconnected endpoints, no permitted directed path, or endpoints snapped to the
@@ -252,12 +305,19 @@ to load or another unavailable dependency uses HTTP 503 with a non-loading code:
 
 ## Corridor scoring
 
-`POST /api/corridor-scores` accepts the route endpoints plus an `edge_coords` object.
+`POST /api/corridor-scores` requires `city`, `graph_revision`, `score_revision`
+(the expected city score generation), route endpoints, and an `edge_coords`
+object. Admission verifies both revisions against the current city state before
+fetching/scoring. Missing required fields return HTTP 422; nonempty revision
+mismatches return HTTP 409. There is no automatic mismatch retry on this endpoint.
 Its response contains:
 
 ```json
 {
   "scores": {"segment-1": 0.72},
+  "graph_revision": "graph-example",
+  "base_score_revision": "city-scores-example",
+  "score_revision": "corridor-scores-example",
   "edge_sources": {
     "segment-1": "opencellid",
     "segment-2": "ml_synthetic"
@@ -270,6 +330,20 @@ Its response contains:
   "bbox": {"min_lat": 0, "min_lon": 0, "max_lat": 0, "max_lon": 0}
 }
 ```
+
+Here `base_score_revision` echoes the admitted city score generation, and
+`score_revision` is a deterministic digest of the corridor result and its
+identities. Equivalent requests include these identities in their shared-work
+key. A request admitted before replacement may finish with its old identities;
+only a route holding that compatible snapshot may use it.
+
+Internal `POST /corridor-feedback/{city}` requires `graph_revision`,
+`base_score_revision`, corridor `score_revision`, and `scores`; routing also sends
+per-edge `edge_sources`.
+Feedback is applied under the city lock only while the graph and base score
+generation still match; otherwise it returns HTTP 409. A rejected late feedback
+does not alter the completed route or trigger a retry. Repeated feedback after a
+material city-score update is likewise rejected as stale.
 
 `scores` contains real-data overrides only. `edge_sources` contains an entry for every
 requested edge, including uncovered edges marked `ml_synthetic`. The routing engine
@@ -301,7 +375,8 @@ towers; otherwise their provenance is `unknown`.
 
 `/scores/source/{city}` reports `source`, `tower_count`,
 `real_data_coverage_percent`, `good_signal_percent`, `dead_zone_percent`, and
-`last_updated`. `GET /api/scores/{city}` additionally reports an `edge_sources` entry
+`last_updated`, `graph_revision`, and `score_revision`. `GET /api/scores/{city}`
+returns both revisions and additionally reports an `edge_sources` entry
 for every returned score; it is the authoritative city-wide per-edge provenance used
 when a later corridor query has no override for that edge. `/cache-status` reports
 fresh tile ingestion progress separately from fresh real-data coverage; cache

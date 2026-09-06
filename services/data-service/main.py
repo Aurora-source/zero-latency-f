@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import ast
 import gc
+import hashlib
 import json
 import math
 import os
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import zlib
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
@@ -241,6 +243,8 @@ class CityState:
     expires_at: float
     segments: list[SegmentRecord]
     segment_lookup: dict[str, int]
+    graph_revision: str = ""
+    score_revision: str = field(default_factory=lambda: uuid.uuid4().hex)
     tile_index: dict[int, dict[int, dict[int, list[int]]]] = field(default_factory=dict)
     edge_tile_map: dict[str, set[tuple[int, int, int]]] = field(default_factory=dict)
     coverage_tile_edge_map: dict[str, list[int]] = field(default_factory=dict)
@@ -252,9 +256,13 @@ class CityState:
     score_source: str = PROVENANCE_ML_SYNTHETIC
     real_score_sources: dict[str, str] = field(default_factory=dict)
     score_metadata: dict[str, Any] = field(default_factory=dict)
+    published: bool = False
 
 
 class CorridorScoresRequest(BaseModel):
+    city: str
+    graph_revision: str
+    score_revision: str
     origin: list[float]
     destination: list[float]
     edge_coords: dict[str, list[float]]
@@ -262,6 +270,9 @@ class CorridorScoresRequest(BaseModel):
 
 
 class CorridorTileUpdateRequest(BaseModel):
+    graph_revision: str
+    base_score_revision: str
+    score_revision: str
     scores: dict[str, float]
     edge_sources: dict[str, str] | None = None
 
@@ -557,10 +568,32 @@ def load_real_scores(city: str, state: CityState) -> tuple[np.ndarray, dict[str,
         return None
 
     with score_path.open("rb") as handle:
-        stored_scores = pickle.load(handle)
+        stored_payload = pickle.load(handle)
 
-    if not isinstance(stored_scores, dict):
+    if not isinstance(stored_payload, dict):
         raise ValueError(f"Unexpected score payload in {score_path}")
+
+    required_fields = {"graph_revision", "score_revision", "scores", "metadata"}
+    if not required_fields.issubset(stored_payload):
+        print(f"[scores] Ignoring unverifiable legacy score cache for {city}")
+        return None
+    stored_graph_revision = stored_payload.get("graph_revision")
+    if not isinstance(stored_graph_revision, str) or stored_graph_revision != state.graph_revision:
+        print(f"[scores] Ignoring score cache for a different graph revision in {city}")
+        return None
+    stored_scores = stored_payload.get("scores")
+    raw_metadata = stored_payload.get("metadata")
+    if not isinstance(stored_scores, dict) or not isinstance(raw_metadata, dict):
+        raise ValueError(f"Unexpected score envelope in {score_path}")
+    raw_score_revision = stored_payload.get("score_revision")
+    stored_score_revision = (
+        raw_score_revision
+        if isinstance(raw_score_revision, str) and raw_score_revision.strip()
+        else ""
+    )
+    if not stored_score_revision:
+        print(f"[scores] Ignoring score cache without a score revision for {city}")
+        return None
 
     score_values = np.full(len(state.segments), ROAD_FALLBACK_SCORE, dtype=np.float32)
     matched = 0
@@ -571,14 +604,13 @@ def load_real_scores(city: str, state: CityState) -> tuple[np.ndarray, dict[str,
         score_values[segment_index] = np.float32(max(0.0, min(1.0, float(score))))
         matched += 1
 
-    raw_metadata = load_json_file(real_scores_meta_path(city))
-    if not raw_metadata:
-        raw_metadata = load_json_file(tower_meta_path(city))
     metadata = {
         **default_score_metadata(city, PROVENANCE_UNKNOWN),
         **raw_metadata,
         "city": city,
         "matched_segments": matched,
+        "graph_revision": state.graph_revision,
+        "score_revision": stored_score_revision,
     }
 
     summary = score_summary(score_values)
@@ -703,6 +735,8 @@ def refresh_score_metadata(
         **state.score_metadata,
         **incoming,
         "city": city,
+        "graph_revision": state.graph_revision,
+        "score_revision": state.score_revision,
         "source": aggregate_source,
         "provenance_source": aggregate_source,
         "real_data_source": real_source,
@@ -1362,6 +1396,8 @@ def update_coverage_model(city: str, tile_id: str, tower_count: int) -> None:
     if state is None:
         return
 
+    expected_graph_revision = state.graph_revision
+    expected_score_revision = state.score_revision
     scores, edge_sources = coverage_scores_for_tile(city_slug, state, tile_id)
     if not scores:
         return
@@ -1379,6 +1415,8 @@ def update_coverage_model(city: str, tile_id: str, tower_count: int) -> None:
             "last_updated": time.strftime("%Y-%m-%d", time.gmtime()),
         },
         edge_sources=edge_sources,
+        expected_graph_revision=expected_graph_revision,
+        expected_score_revision=expected_score_revision,
     )
     print(f"[adaptive] updated {len(scores)} segment scores from tile {tile_id}")
 
@@ -1880,6 +1918,11 @@ def graph_cache_path(city: str) -> Path:
     return GRAPH_CACHE_DIR / f"{normalize_city(city)}.graphml"
 
 
+def graph_revision(graph: Any) -> str:
+    value = graph.graph.get("graph_revision")
+    return value if isinstance(value, str) and value.strip() else ""
+
+
 def publish_graph_cache(graph: Any, cache_path: Path) -> None:
     """Atomically publish the GraphML file owned by the data service.
 
@@ -1887,6 +1930,9 @@ def publish_graph_cache(graph: Any, cache_path: Path) -> None:
     file first ensures they observe either the previous complete graph or the new
     complete graph, including when serialization is interrupted.
     """
+    # Every publication gets a new identity, including a modified graph copied
+    # from an older publication. Plain reloads do not republish or rotate it.
+    graph.graph["graph_revision"] = uuid.uuid4().hex
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=cache_path.parent,
@@ -1931,7 +1977,11 @@ def load_or_fetch_graph(city: str):
 
     if cache_path.exists():
         print(f"[graph] Loading Bangalore graph (cached: yes)")
-        return ox.load_graphml(cache_path, edge_dtypes={"speed_kph": str, "travel_time": str})
+        graph = ox.load_graphml(cache_path, edge_dtypes={"speed_kph": str, "travel_time": str})
+        if not graph_revision(graph):
+            publish_graph_cache(graph, cache_path)
+            print(f"[graph] migrated legacy graph cache with a durable revision")
+        return graph
 
     local_graph = load_local_graph_fallback(city_slug)
     if local_graph is not None:
@@ -2013,6 +2063,7 @@ def load_city_state(city: str) -> CityState:
 
         # Publish only after score hydration is complete. Readers therefore get one
         # internally consistent graph/segment/score state.
+        state.published = True
         GRAPH_CACHE[city_slug] = state
         ACTIVE_CITY = city_slug
         return state
@@ -2047,6 +2098,7 @@ def require_city_state(city: str) -> CityState:
 def build_prediction_payload(city: str, state: CityState) -> dict[str, Any]:
     return {
         "city": city,
+        "graph_revision": state.graph_revision,
         "segments": [
             {
                 "id": segment.segment_id,
@@ -2071,12 +2123,16 @@ def post_prediction_scores(city: str, state: CityState) -> tuple[dict[str, float
 
     with request.urlopen(prediction_request, timeout=120) as response:
         data = json.loads(response.read().decode("utf-8"))
+    response_revision = str(data.get("graph_revision") or "")
+    if response_revision != state.graph_revision:
+        raise ValueError("Prediction response graph revision is absent or incompatible")
     raw_scores = data.get("scores", {})
     metadata = {
         **default_score_metadata(city, PROVENANCE_ML_SYNTHETIC, updated_at=time.time()),
         "source": PROVENANCE_ML_SYNTHETIC,
         "data_source": str(data.get("data_source") or "synthetic"),
         "confidence": float(data.get("confidence") or 0.0),
+        "graph_revision": response_revision,
     }
     return ({str(key): float(value) for key, value in raw_scores.items()}, metadata)
 
@@ -2087,13 +2143,25 @@ def apply_city_scores(
     scores: dict[str, float],
     metadata: dict[str, Any] | None = None,
     edge_sources: dict[str, str] | None = None,
-) -> None:
+    *,
+    expected_graph_revision: str | None = None,
+    expected_score_revision: str | None = None,
+) -> bool:
     city_slug = normalize_city(city)
     incoming_source = canonical_provenance((metadata or {}).get("source"))
     prediction_update = incoming_source == PROVENANCE_ML_SYNTHETIC
     provided_edge_sources = edge_sources or {}
 
     with CITY_LOCKS[city_slug]:
+        published_state = GRAPH_CACHE.get(city_slug)
+        if getattr(state, "published", True) and published_state is not state:
+            return False
+        if expected_graph_revision is not None and state.graph_revision != expected_graph_revision:
+            return False
+        if expected_score_revision is not None and state.score_revision != expected_score_revision:
+            return False
+        previous_metadata = dict(state.score_metadata)
+        previous_score_source = state.score_source
         changed = False
         provenance_changed = False
         current_scores = (
@@ -2138,19 +2206,34 @@ def apply_city_scores(
                 )
 
         state.score_values = to_device_array(current_scores)
-        state.scores_updated_at = time.time()
         refresh_score_metadata(city_slug, state, metadata)
-        if changed or provenance_changed:
+        metadata_changed = (
+            state.score_metadata != previous_metadata
+            or state.score_source != previous_score_source
+        )
+        revision_changed = changed or provenance_changed or metadata_changed
+        if revision_changed:
+            state.scores_updated_at = time.time()
+            state.score_revision = uuid.uuid4().hex
+            state.score_metadata["graph_revision"] = state.graph_revision
+            state.score_metadata["score_revision"] = state.score_revision
+            state.score_metadata["last_updated"] = time.strftime(
+                "%Y-%m-%d", time.gmtime(state.scores_updated_at)
+            )
             state.tile_cache.clear()
             with HOTSPOT_CACHE_LOCK:
                 HOTSPOT_CACHE.clear()
     free_gpu_memory()
+    return True
 
 
 def update_corridor_tiles(
     city: str,
     scores: dict[str, float],
     edge_sources: dict[str, str] | None = None,
+    *,
+    expected_graph_revision: str | None = None,
+    expected_score_revision: str | None = None,
 ) -> int:
     city_slug = normalize_city(city)
     state = GRAPH_CACHE.get(city_slug)
@@ -2170,13 +2253,17 @@ def update_corridor_tiles(
         for edge_id in valid_scores
     }
     coverage_metadata = cached_coverage_metadata(city_slug) or {}
-    apply_city_scores(
+    applied = apply_city_scores(
         city_slug,
         state,
         valid_scores,
         coverage_metadata,
         edge_sources=valid_sources,
+        expected_graph_revision=expected_graph_revision,
+        expected_score_revision=expected_score_revision,
     )
+    if not applied:
+        return 0
     invalidated = {
         tile_key
         for edge_id in valid_scores
@@ -2195,14 +2282,25 @@ def refresh_state_predictions(city: str, state: CityState) -> None:
         return
     if len(state.real_score_sources) >= len(state.segments):
         return
-
+    expected_graph_revision = state.graph_revision
+    expected_score_revision = state.score_revision
     try:
         scores, metadata = post_prediction_scores(city_slug, state)
     except (TimeoutError, error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"[prediction] failed to refresh {city_slug}: {exc}")
         return
 
-    apply_city_scores(city_slug, state, scores, metadata)
+    applied = apply_city_scores(
+        city_slug,
+        state,
+        scores,
+        metadata,
+        expected_graph_revision=expected_graph_revision,
+        expected_score_revision=expected_score_revision,
+    )
+    if not applied:
+        print(f"[prediction] discarded stale response for {city_slug}")
+        return
     print(
         f"[prediction] refreshed {city_slug} with {len(scores)} segment scores "
         f"from {metadata['data_source']}"
@@ -2227,6 +2325,9 @@ def prediction_refresh_loop() -> None:
 
 def build_city_state(city: str, graph, expires_at: float) -> CityState:
     city_slug = normalize_city(city)
+    revision = graph_revision(graph)
+    if not revision:
+        raise GraphLoadTransientError("Graph must be published with a revision before scoring")
     (
         segments,
         segment_lookup,
@@ -2247,6 +2348,7 @@ def build_city_state(city: str, graph, expires_at: float) -> CityState:
         expires_at=expires_at,
         segments=segments,
         segment_lookup=segment_lookup,
+        graph_revision=revision,
         tile_index=tile_index,
         edge_tile_map=edge_tile_map,
         coverage_tile_edge_map=coverage_tile_edge_map,
@@ -2257,11 +2359,14 @@ def build_city_state(city: str, graph, expires_at: float) -> CityState:
         score_source=PROVENANCE_ML_SYNTHETIC,
         score_metadata=default_score_metadata(city_slug, PROVENANCE_ML_SYNTHETIC),
     )
+    state.score_metadata["graph_revision"] = state.graph_revision
+    state.score_metadata["score_revision"] = state.score_revision
     loaded_real = load_real_scores(city_slug, state)
     if loaded_real is not None:
         real_values, metadata = loaded_real
         state.score_values = to_device_array(real_values)
         state.scores_updated_at = time.time()
+        state.score_revision = str(metadata["score_revision"])
         real_source = canonical_provenance(
             metadata.get("real_data_source") or metadata.get("source")
         )
@@ -2765,6 +2870,8 @@ def score_source_payload(state: CityState) -> dict[str, Any]:
         city = state.city
         score_source = state.score_source
         scores_updated_at = state.scores_updated_at
+        graph_revision_value = state.graph_revision
+        score_revision_value = state.score_revision
         metadata = {
             **default_score_metadata(
                 city,
@@ -2782,6 +2889,8 @@ def score_source_payload(state: CityState) -> dict[str, Any]:
     if real_coverage is None:
         real_coverage = 0.0
     metadata["city"] = city
+    metadata["graph_revision"] = graph_revision_value
+    metadata["score_revision"] = score_revision_value
     metadata["source"] = canonical_provenance(score_source)
     metadata["provenance_source"] = metadata["source"]
     metadata["real_data_coverage_percent"] = real_coverage
@@ -2816,6 +2925,8 @@ def get_scores(city: str) -> dict[str, Any]:
         segments = tuple(state.segments)
         updated_at = state.scores_updated_at
         source = canonical_provenance(state.score_source)
+        graph_revision_value = state.graph_revision
+        score_revision_value = state.score_revision
         edge_sources = {
             segment.segment_id: edge_score_provenance(state, segment.segment_id)
             for segment in segments
@@ -2823,6 +2934,8 @@ def get_scores(city: str) -> dict[str, Any]:
 
     return {
         "city": city_slug,
+        "graph_revision": graph_revision_value,
+        "score_revision": score_revision_value,
         "updated_at": updated_at,
         "source": source,
         "provenance_source": source,
@@ -2898,6 +3011,9 @@ async def get_corridor_towers(
 
 def corridor_score_request_key(payload: CorridorScoresRequest) -> tuple[Any, ...]:
     return (
+        normalize_city(payload.city),
+        payload.graph_revision,
+        payload.score_revision,
         tuple(float(value) for value in payload.origin),
         tuple(float(value) for value in payload.destination),
         float(payload.padding_km),
@@ -2913,7 +3029,37 @@ def corridor_score_request_key(payload: CorridorScoresRequest) -> tuple[Any, ...
     )
 
 
+def admit_corridor_snapshot(city: str, graph_revision_value: str, score_revision: str) -> tuple[str, str]:
+    city_slug = normalize_city(city)
+    # Admission only compares immutable identity strings and never reads score
+    # arrays. Avoid blocking the async event loop behind a graph build; repeat
+    # the pointer/identity check to detect a concurrent publication.
+    for _attempt in range(3):
+        state = GRAPH_CACHE.get(city_slug)
+        if state is None:
+            break
+        admitted = (state.graph_revision, state.score_revision)
+        if GRAPH_CACHE.get(city_slug) is state and admitted == (
+            state.graph_revision,
+            state.score_revision,
+        ):
+            if admitted == (graph_revision_value, score_revision):
+                return admitted
+            break
+    raise HTTPException(
+        status_code=409,
+        detail="Corridor score request revisions do not match the current city snapshot",
+    )
+
+
 async def _calculate_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]:
+    if not payload.graph_revision.strip() or not payload.score_revision.strip():
+        raise HTTPException(status_code=409, detail="Corridor revisions must be nonempty")
+    admitted_graph_revision, admitted_score_revision = admit_corridor_snapshot(
+        payload.city,
+        payload.graph_revision,
+        payload.score_revision,
+    )
     if len(payload.origin) != 2 or len(payload.destination) != 2:
         raise HTTPException(status_code=422, detail="origin and destination must contain [lat, lon]")
     invalid_edges = [
@@ -2994,7 +3140,7 @@ async def _calculate_corridor_scores(payload: CorridorScoresRequest) -> dict[str
         (sum(1 for score in scores.values() if float(score) >= 0.6) / max(len(scores), 1)) * 100.0,
         1,
     ) if scores else 0.0
-    return {
+    response_payload = {
         "scores": scores,
         "source": source,
         "provenance_source": source,
@@ -3007,13 +3153,31 @@ async def _calculate_corridor_scores(payload: CorridorScoresRequest) -> dict[str
         "coverage_percent": real_coverage,
         "real_data_percent": real_coverage,
     }
+    digest_payload = {
+        "graph_revision": admitted_graph_revision,
+        "base_score_revision": admitted_score_revision,
+        **response_payload,
+    }
+    corridor_revision = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "graph_revision": admitted_graph_revision,
+        "base_score_revision": admitted_score_revision,
+        "score_revision": corridor_revision,
+        **response_payload,
+    }
 
 
 @app.post("/corridor-scores")
 async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]:
+    try:
+        request_key = corridor_score_request_key(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     return await run_singleflight(
         CORRIDOR_SCORE_TASKS,
-        corridor_score_request_key(payload),
+        request_key,
         lambda: _calculate_corridor_scores(payload),
     )
 
@@ -3021,12 +3185,42 @@ async def post_corridor_scores(payload: CorridorScoresRequest) -> dict[str, Any]
 @app.post("/corridor-feedback/{city}")
 def post_corridor_feedback(city: str, payload: CorridorTileUpdateRequest) -> dict[str, Any]:
     try:
-        updated = update_corridor_tiles(city, payload.scores, payload.edge_sources)
+        city_slug = normalize_city(city)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    if (
+        not payload.graph_revision.strip()
+        or not payload.base_score_revision.strip()
+        or not payload.score_revision.strip()
+    ):
+        raise HTTPException(status_code=409, detail="Corridor revisions must be nonempty")
+    with CITY_LOCKS[city_slug]:
+        state = GRAPH_CACHE.get(city_slug)
+        if (
+            state is None
+            or state.graph_revision != payload.graph_revision
+            or state.score_revision != payload.base_score_revision
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="Corridor feedback revisions do not match the current city snapshot",
+            )
+        try:
+            updated = update_corridor_tiles(
+                city,
+                payload.scores,
+                payload.edge_sources,
+                expected_graph_revision=payload.graph_revision,
+                expected_score_revision=payload.base_score_revision,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return {
-        "city": normalize_city(city),
+        "city": city_slug,
+        "graph_revision": payload.graph_revision,
+        "base_score_revision": payload.base_score_revision,
+        "corridor_score_revision": payload.score_revision,
         "updated_edges": updated,
         "status": "ok",
     }

@@ -34,7 +34,7 @@ def load_data_service() -> dict[str, object]:
 
 
 def synthetic_graph() -> nx.MultiDiGraph:
-    graph = nx.MultiDiGraph(crs="EPSG:4326")
+    graph = nx.MultiDiGraph(crs="EPSG:4326", graph_revision="graph-test")
     graph.add_node(1, x=77.59, y=12.97)
     graph.add_node(2, x=77.60, y=12.98)
     graph.add_edge(1, 2, key=0, length=1000.0, highway="residential")
@@ -66,6 +66,9 @@ class DataConcurrencyTests(unittest.TestCase):
         post_corridor_scores = self.data["post_corridor_scores"]
         globals_dict = post_corridor_scores.__globals__
         payload = self.data["CorridorScoresRequest"](
+            city="bangalore",
+            graph_revision="graph-test",
+            score_revision="score-test",
             origin=[12.97, 77.59],
             destination=[12.98, 77.60],
             edge_coords={"1-2-0": [12.975, 77.595]},
@@ -73,6 +76,10 @@ class DataConcurrencyTests(unittest.TestCase):
         )
         fetch_calls = 0
         score_calls = 0
+        state = SimpleNamespace(
+            graph_revision="graph-test",
+            score_revision="score-test",
+        )
 
         async def exercise() -> tuple[dict[str, object], dict[str, object]]:
             nonlocal fetch_calls, score_calls
@@ -111,6 +118,7 @@ class DataConcurrencyTests(unittest.TestCase):
                     "fetch_towers_cached": fake_fetch,
                     "compute_scores_from_towers": fake_score,
                     "CORRIDOR_SCORE_TASKS": {},
+                    "GRAPH_CACHE": {"bangalore": state},
                 },
             ):
                 first = asyncio.create_task(post_corridor_scores(payload))
@@ -228,6 +236,7 @@ class DataConcurrencyTests(unittest.TestCase):
             expires_at=time.time() + 60.0,
             segments=[object()],
             real_score_sources={},
+            published=False,
         )
         hydrate_started = threading.Event()
         release_hydration = threading.Event()
@@ -347,6 +356,8 @@ class DataConcurrencyTests(unittest.TestCase):
         )
         state = SimpleNamespace(
             city="bangalore",
+            graph_revision="graph-test",
+            score_revision="score-test",
             score_values=np.asarray([0.25], dtype=np.float32),
             scores_updated_at=10.0,
             score_source="opencellid",
