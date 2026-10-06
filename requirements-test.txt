@@ -1,4 +1,5 @@
 -r services/data-service/requirements.txt
 -r services/routing-engine/requirements.txt
+-r services/prediction-service/requirements.txt
 
-pytest==8.3.4
+pytest==9.0.3

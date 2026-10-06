@@ -1,6 +1,29 @@
 import type { Hotspot } from "./supabase";
 
 const API_BASE = "/api";
+export const ROUTE_TIMEOUT_MS = 90_000;
+
+// Include response-body reads in the deadline and propagate input cancellation.
+async function boundedFetch(url: string, init: RequestInit = {}, timeoutMs = 30_000): Promise<Response> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) cancel();
+  init.signal?.addEventListener("abort", cancel, { once: true });
+  let timedOut = false;
+  const timer = window.setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const body = await response.arrayBuffer();
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  } catch (error) {
+    if (timedOut) throw new Error("The request timed out. Try again when the services are ready.");
+    if (init.signal?.aborted) throw error;
+    throw new Error("Cannot reach the local services. Check they are running, then retry.");
+  } finally {
+    window.clearTimeout(timer);
+    init.signal?.removeEventListener("abort", cancel);
+  }
+}
 
 export type Strategy = "fastest" | "balanced" | "connected";
 export type Vehicle = "scooter" | "bike" | "car" | "truck";
@@ -55,6 +78,9 @@ export interface RouteSignalSegment {
 }
 
 export interface RouteResponse {
+  graphRevision?: string;
+  scoreRevision?: string;
+  corridorScoreRevision?: string | null;
   strategy: Strategy;
   vehicle: Vehicle;
   etaMinutes: number;
@@ -154,9 +180,11 @@ export interface CorridorScoreResponse {
 }
 
 export async function fetchCities(): Promise<string[]> {
-  const res = await fetch(`${API_BASE}/cities`);
+  const res = await boundedFetch(`${API_BASE}/cities`);
   if (!res.ok) throw new Error("Failed to fetch cities");
-  return res.json();
+  const data: unknown = await res.json();
+  if (!Array.isArray(data) || !data.every((city) => typeof city === "string")) throw new Error("The city response is invalid. Retry after checking the data service.");
+  return data;
 }
 
 export interface CityContext {
@@ -189,10 +217,18 @@ export interface CoverageStatusInfo {
   ingestion_running: boolean;
 }
 
+export async function fetchPredictionReady(): Promise<boolean> {
+  const response = await boundedFetch(`${API_BASE}/ready/prediction`, {}, 5_000);
+  if (!response.ok) return false;
+  const data = await response.json();
+  return data.model_ready === true && data.status === "ready";
+}
+
 export async function fetchCityContext(city: string): Promise<CityContext> {
-  const res = await fetch(`${API_BASE}/city-context/${city}`);
+  const res = await boundedFetch(`${API_BASE}/city-context/${city}`);
   if (!res.ok) throw new Error("Failed to fetch city context");
   const data = await res.json();
+  if (![data.center, data.origin, data.destination].every(validCoordinates)) throw new Error("The city coordinates are invalid.");
   return {
     center: [data.center[0], data.center[1]],
     origin: [data.origin[0], data.origin[1]],
@@ -201,7 +237,7 @@ export async function fetchCityContext(city: string): Promise<CityContext> {
 }
 
 export async function fetchScoreSource(city: string): Promise<ScoreSourceInfo> {
-  const res = await fetch(`${API_BASE}/scores/source/${city}`);
+  const res = await boundedFetch(`${API_BASE}/scores/source/${city}`);
   if (!res.ok) {
     throw new Error("Failed to fetch score source");
   }
@@ -227,7 +263,7 @@ export async function fetchScoreSource(city: string): Promise<ScoreSourceInfo> {
 }
 
 export async function fetchCoverageStatus(): Promise<CoverageStatusInfo> {
-  const res = await fetch(`${API_BASE}/cache-status`);
+  const res = await boundedFetch(`${API_BASE}/cache-status`);
   if (!res.ok) {
     throw new Error("Failed to fetch coverage status");
   }
@@ -246,7 +282,7 @@ export async function fetchCoverageStatus(): Promise<CoverageStatusInfo> {
 }
 
 export async function preloadCity(city: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/preload/${city}`, { method: "POST" });
+  const res = await boundedFetch(`${API_BASE}/preload/${city}`, { method: "POST" });
   if (!res.ok) {
     throw new Error(await readError(res));
   }
@@ -263,7 +299,7 @@ export async function fetchHotspotsForViewport(
   url.searchParams.set("max_lon", String(viewport.maxLon));
   url.searchParams.set("zoom", String(viewport.zoom));
 
-  const res = await fetch(url.toString());
+  const res = await boundedFetch(url.toString());
   if (!res.ok) {
     throw new Error(await readError(res));
   }
@@ -284,7 +320,7 @@ export async function fetchTowerData(params: {
   url.searchParams.set("dest_lon", String(params.destination[1]));
   url.searchParams.set("padding_km", String(params.paddingKm ?? 3));
 
-  const res = await fetch(url.toString());
+  const res = await boundedFetch(url.toString());
   if (!res.ok) {
     throw new Error(await readError(res));
   }
@@ -303,15 +339,21 @@ export async function fetchTowerData(params: {
 }
 
 export async function fetchSignalCoverage(payload: {
+  city: string;
+  graphRevision: string;
+  scoreRevision: string;
   origin: [number, number];
   destination: [number, number];
   edgeCoords: Record<string, [number, number]>;
   paddingKm?: number;
 }): Promise<CorridorScoreResponse> {
-  const res = await fetch(`${API_BASE}/corridor-scores`, {
+  const res = await boundedFetch(`${API_BASE}/corridor-scores`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      city: payload.city,
+      graph_revision: payload.graphRevision,
+      score_revision: payload.scoreRevision,
       origin: payload.origin,
       destination: payload.destination,
       edge_coords: payload.edgeCoords,
@@ -366,29 +408,20 @@ export async function fetchSignalCoverage(payload: {
   };
 }
 
-export async function geocodeLocation(query: string): Promise<[number, number]> {
-  const url = new URL("https://nominatim.openstreetmap.org/search");
+export async function geocodeLocation(query: string, signal?: AbortSignal): Promise<[number, number]> {
+  const url = new URL(`${window.location.origin}${API_BASE}/geocode`);
   url.searchParams.set("q", query);
-  url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "1");
 
-  const res = await fetch(url.toString());
+  // Allow the provider's 10-second timeout and serialized-request spacing to
+  // return the useful map/coordinate fallback before the browser deadline.
+  const res = await boundedFetch(url.toString(), { signal }, 15_000);
   if (!res.ok) {
-    throw new Error("Failed to search location");
+    throw new Error(await readError(res));
   }
 
-  const results = (await res.json()) as Array<{ lat: string; lon: string }>;
-  if (!results.length) {
-    throw new Error("Location not found");
-  }
-
-  const lat = Number(results[0].lat);
-  const lon = Number(results[0].lon);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    throw new Error("Location not found");
-  }
-
-  return [lat, lon];
+  const data = await res.json();
+  if (!validCoordinates(data?.coordinates)) throw new Error("Place search returned invalid coordinates. Pick the map instead.");
+  return data.coordinates;
 }
 
 function haversine(a: [number, number], b: [number, number]): number {
@@ -439,9 +472,10 @@ async function readResponseValue(res: Response): Promise<unknown> {
 }
 
 function responseMessage(value: unknown): string | null {
-  if (typeof value === "string") return value || null;
+  if (typeof value === "string") return null;
   const data = asObject(value);
   if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return "Check the coordinates, vehicle and routing mode, then try again.";
   if (typeof data.message === "string") return data.message;
   return null;
 }
@@ -513,7 +547,7 @@ function formatSignalSourceLabel(source: ProvenanceSource, towerCount: number): 
   if (source === "unknown") {
     return "Unknown signal provenance";
   }
-  return "ML estimate";
+  return "Model or fallback estimate";
 }
 
 function retryAfterSeconds(res: Response, data: JsonObject): number {
@@ -560,8 +594,9 @@ export function isRouteLoadingResponse(
 
 export async function fetchRoute(
   payload: RouteRequestPayload,
+  signal?: AbortSignal,
 ): Promise<RouteResponse | RouteLoadingResponse> {
-  const res = await fetch(`${API_BASE}/route`, {
+  const res = await boundedFetch(`${API_BASE}/route`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -571,7 +606,8 @@ export async function fetchRoute(
       mode: payload.strategy,
       vehicle: payload.vehicle,
     }),
-  });
+    signal,
+  }, ROUTE_TIMEOUT_MS);
   const responseValue = await readResponseValue(res);
   const data = asObject(responseValue);
 
@@ -590,6 +626,13 @@ export async function fetchRoute(
   }
 
   const pathGeoJson = asObject(data.path_geojson);
+  if (pathGeoJson.type !== "LineString" || !Array.isArray(pathGeoJson.coordinates) || pathGeoJson.coordinates.length < 2 ||
+      !pathGeoJson.coordinates.every((point) => Array.isArray(point) && validCoordinates([point[1], point[0]])) ||
+      typeof data.total_time_min !== "number" || !Number.isFinite(data.total_time_min) || data.total_time_min < 0 ||
+      typeof data.avg_connectivity !== "number" || !Number.isFinite(data.avg_connectivity) || data.avg_connectivity < 0 || data.avg_connectivity > 1 ||
+      (data.vehicle !== undefined && data.vehicle !== payload.vehicle) || (data.mode !== undefined && data.mode !== payload.strategy)) {
+    throw new Error("The routing service returned an invalid route. Please retry.");
+  }
   const coordinates: [number, number][] =
     Array.isArray(pathGeoJson.coordinates)
       ? pathGeoJson.coordinates.flatMap((coordinate) => {
@@ -605,6 +648,11 @@ export async function fetchRoute(
     data.provenance_source ?? data.signal_source ?? data.source,
   );
   const routeEdgeSources = asObject(data.edge_sources);
+  if (Array.isArray(data.signal_segments) && !data.signal_segments.every((rawSegment) => {
+    const segment = asObject(rawSegment);
+    return Array.isArray(segment.coordinates) && segment.coordinates.length >= 2 && segment.coordinates.every(validCoordinates) &&
+      typeof segment.score === "number" && Number.isFinite(segment.score) && segment.score >= 0 && segment.score <= 1;
+  })) throw new Error("The routing service returned invalid signal geometry. Please retry.");
   const signalSegments = Array.isArray(data.signal_segments)
     ? data.signal_segments.map((rawSegment) => {
         const segment = asObject(rawSegment);
@@ -624,6 +672,9 @@ export async function fetchRoute(
     : [];
 
   return {
+    graphRevision: typeof data.graph_revision === "string" ? data.graph_revision : undefined,
+    scoreRevision: typeof data.score_revision === "string" ? data.score_revision : undefined,
+    corridorScoreRevision: typeof data.corridor_score_revision === "string" ? data.corridor_score_revision : null,
     strategy: payload.strategy,
     vehicle: (data.vehicle ?? payload.vehicle) as Vehicle,
     etaMinutes: asNumber(data.total_time_min),
@@ -642,12 +693,24 @@ export async function fetchRoute(
     ),
     goodSignalPercent: asPercent(data.good_signal_percent),
     explanation:
-      (data.explanation as RouteExplanation | undefined) ?? {
+      validExplanation(data.explanation) ? data.explanation : {
         summary: "No explanation available",
         factors: [],
         score_breakdown: { connectivity: 0, speed: 0, risk: 0 },
       },
   };
+}
+
+function validCoordinates(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length === 2 && value.every((item) => typeof item === "number" && Number.isFinite(item)) && Math.abs(value[0]) <= 90 && Math.abs(value[1]) <= 180;
+}
+
+function validExplanation(value: unknown): value is RouteExplanation {
+  const data = asObject(value);
+  const breakdown = asObject(data.score_breakdown);
+  return typeof data.summary === "string" && Array.isArray(data.factors) &&
+    data.factors.every((factor) => { const entry = asObject(factor); return typeof entry.factor === "string" && typeof entry.detail === "string" && ["positive", "negative"].includes(String(entry.impact)); }) &&
+    [breakdown.connectivity, breakdown.speed, breakdown.risk].every((score) => typeof score === "number" && Number.isFinite(score));
 }
 
 export function formatRouteForUI(route: RouteResponse, color: string): FormattedRoute {
@@ -668,7 +731,7 @@ export function formatRouteForUI(route: RouteResponse, color: string): Formatted
     color,
     warning:
       route.provenanceSource === "ml_synthetic"
-        ? "Signal data unavailable - using ML estimate"
+        ? "Estimated signal; measured coverage is unavailable"
         : route.provenanceSource === "unknown"
           ? "Signal data provenance is unavailable"
           : route.strategy === "fastest" && (route.connectivity ?? 0) < 0.5

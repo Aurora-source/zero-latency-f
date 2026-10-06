@@ -1,131 +1,126 @@
+name: zero-latency
+x-runtime: &runtime
+  restart: unless-stopped
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=128m,mode=1777"]
+  stop_grace_period: 90s
+  logging:
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+  networks: [application]
+x-environment: &environment
+  APP_ENV: production
+  LOCAL_DATA_ONLY: "1"
+  ENV_FILE_PATH: /dev/null
+  ALLOW_MODEL_TRAINING: "0"
+  PREDICTION_DEVICE: cpu
+  CUDA_VISIBLE_DEVICES: ""
+  SUPPORTED_CITIES: bangalore
+  DEFAULT_CITY: bangalore
+  MODEL_THREADS: "2"
+  ROUTING_THREADS: "2"
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "2"
+  DATA_SERVICE_URL: http://data-service:8001
+  PREDICTION_SERVICE_URL: http://prediction-service:8003
+  APP_CACHE_DIR: /runtime
+  GRAPH_CACHE_DIR: /runtime/graphs
+  MODEL_DIR: /artifacts
+  LOCAL_TOWER_CSV_PATH: /artifacts/bangalore_towers.csv
+  LOCAL_TOWER_PROVENANCE: unknown
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  XDG_CACHE_HOME: /runtime
+x-artifacts: &artifacts
+  type: bind
+  source: ${ARTIFACT_DIR:?Set ARTIFACT_DIR to the prepared immutable release directory}
+  target: /artifacts
+  read_only: true
+  bind: {create_host_path: false}
 services:
   prediction-service:
-    build:
-      context: ./services/prediction-service
-    container_name: connectivity-prediction-service
-    ports:
-      - "8003:8003"
+    <<: *runtime
+    image: zero-latency-prediction:${RELEASE_TAG:-local}
+    build: {context: ., dockerfile: services/prediction-service/Dockerfile}
     environment:
-      - MAX_RAM_MB=1024
-      - APP_CACHE_DIR=/app/shared-cache
-    volumes:
-      - ./services/prediction-service/models:/app/models
-      - ./cache:/app/shared-cache
+      <<: *environment
+      MAX_RAM_MB: "768"
+    volumes: [*artifacts, "prediction-runtime:/runtime"]
+    mem_limit: 768m
+    cpus: 0.5
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/ready', timeout=5)"]
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8003/ready', timeout=3)"]
       interval: 10s
       timeout: 5s
-      retries: 120
+      retries: 6
       start_period: 30s
-
   data-service:
-    build:
-      context: ./services/data-service
-    container_name: connectivity-data-service
+    <<: *runtime
+    image: zero-latency-data:${RELEASE_TAG:-local}
+    build: {context: ., dockerfile: services/data-service/Dockerfile}
     depends_on:
-      prediction-service:
-        condition: service_healthy
+      prediction-service: {condition: service_healthy}
     environment:
-      - SUPPORTED_CITIES=bangalore
-      - DEFAULT_CITY=bangalore
-      - PREDICTION_SERVICE_URL=http://prediction-service:8003
-      - APP_CACHE_DIR=/app/shared-cache
-      - GRAPH_CACHE_DIR=/app/shared-cache/graphs
-      - HOTSPOT_CACHE_PATH=/app/shared-cache/hotspots.json
-      - HEATMAP_VIEWPORT_ONLY=1
-      - ROUTING_MODES=fastest,balanced,connected
-      - MAX_RAM_MB=1536
-      - OPENCELLID_KEYS=${OPENCELLID_KEYS:-}
-      - OPENCELLID_TOKEN=${OPENCELLID_TOKEN:-}
-      - OPENCELLID_KEY_STATE_PATH=/app/shared-cache/towers/api_key_state.json
-      - TOWER_CACHE_DB_PATH=/app/shared-cache/towers/tower_cache.db
-      - LOCAL_TOWER_CSV_PATH=/app/shared-cache/towers/bangalore_towers.csv
-      - LOCAL_TOWER_PROVENANCE=${LOCAL_TOWER_PROVENANCE:-unknown}
-      - REAL_SCORE_DIR=/app/shared-cache/scores
-      - TOWER_DIR=/app/shared-cache/towers
-    ports:
-      - "8001:8001"
-    volumes:
-      - ./cache:/app/shared-cache
+      <<: *environment
+      MAX_RAM_MB: "4096"
+      TOWER_CACHE_DB_PATH: /runtime/towers/tower_cache.db
+      TOWER_DIR: /runtime/towers
+      REAL_SCORE_DIR: /runtime/scores
+      HOTSPOT_CACHE_PATH: /runtime/hotspots.json
+      OSMNX_HTTP_CACHE_DIR: /runtime/osmnx-http
+    volumes: [*artifacts, "data-runtime:/runtime", "graph-publication:/runtime/graphs"]
+    mem_limit: 4g
+    cpus: 1.25
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/ready', timeout=5)"]
-      interval: 10s
-      timeout: 5s
-      retries: 90
-      start_period: 20s
-
-  routing-engine:
-    build:
-      context: ./services/routing-engine
-    container_name: connectivity-routing-engine
-    depends_on:
-      data-service:
-        condition: service_healthy
-    environment:
-      - SUPPORTED_CITIES=bangalore
-      - DEFAULT_CITY=bangalore
-      - DATA_SERVICE_URL=http://data-service:8001
-      - APP_CACHE_DIR=/app/shared-cache
-      - GRAPH_CACHE_DIR=/app/shared-cache/graphs
-      - ROUTE_CACHE_PATH=/app/shared-cache/route_cache.json
-      - HEATMAP_VIEWPORT_ONLY=1
-      - ROUTING_MODES=fastest,balanced,connected
-      - MAX_RAM_MB=2048
-    ports:
-      - "8002:8002"
-    volumes:
-      - ./services/routing-engine/data:/app/data
-      - ./cache:/app/shared-cache
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=5)"]
-      interval: 10s
-      timeout: 5s
-      retries: 90
-      start_period: 20s
-
-  visualization:
-    build:
-      context: ./services/visualization
-    container_name: connectivity-visualization
-    depends_on:
-      data-service:
-        condition: service_healthy
-      routing-engine:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ >/dev/null"]
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/ready', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 30
-      start_period: 10s
-
-  gateway:
-    image: nginx:1.27-alpine
-    container_name: connectivity-gateway
+      start_period: 120s
+  routing-engine:
+    <<: *runtime
+    image: zero-latency-routing:${RELEASE_TAG:-local}
+    build: {context: ., dockerfile: services/routing-engine/Dockerfile}
     depends_on:
-      prediction-service:
-        condition: service_healthy
-      data-service:
-        condition: service_healthy
-      routing-engine:
-        condition: service_healthy
-      visualization:
-        condition: service_healthy
-    ports:
-      - "80:80"
-    volumes:
-      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      data-service: {condition: service_healthy}
+    environment:
+      <<: *environment
+      MAX_RAM_MB: "4096"
+      ROUTE_CACHE_PATH: /runtime/route_cache.json
+    volumes: [*artifacts, "routing-runtime:/runtime", "graph-publication:/runtime/graphs:ro"]
+    mem_limit: 4g
+    cpus: 2
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/ready', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 120s
+  gateway:
+    <<: *runtime
+    image: zero-latency-gateway:${RELEASE_TAG:-local}
+    build: {context: ., dockerfile: services/visualization/Dockerfile}
+    ports: ["127.0.0.1:${GATEWAY_PORT:-8080}:8080"]
+    mem_limit: 256m
+    cpus: 0.25
     healthcheck:
       test:
         - CMD-SHELL
         - >-
-          wget -qO- http://127.0.0.1/api/ready/data >/dev/null &&
-          wget -qO- http://127.0.0.1/api/ready/routing >/dev/null &&
-          wget -qO- http://127.0.0.1/api/ready/prediction >/dev/null &&
-          wget -qO- http://127.0.0.1/ >/dev/null
+          wget -qO- http://127.0.0.1:8080/healthz >/dev/null &&
+          wget -qO- http://127.0.0.1:8080/api/ready/data >/dev/null &&
+          wget -qO- http://127.0.0.1:8080/api/ready/routing >/dev/null &&
+          wget -qO- http://127.0.0.1:8080/api/ready/prediction >/dev/null
       interval: 10s
-      timeout: 8s
-      retries: 12
-      start_period: 10s
+      timeout: 15s
+      retries: 30
+      start_period: 120s
+networks:
+  application: {}
+volumes:
+  prediction-runtime: {}
+  data-runtime: {}
+  routing-runtime: {}
+  graph-publication: {}

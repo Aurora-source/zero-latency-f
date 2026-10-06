@@ -51,6 +51,8 @@ LOCAL_TOWER_CSV_PATH = Path(
 )
 LOCAL_TOWER_PROVENANCE = os.getenv("LOCAL_TOWER_PROVENANCE", "unknown")
 LOCAL_TOWER_SOURCE: dict[str, Any] | None = None
+# Local validation must not fall through to external ingestion when data is absent.
+LOCAL_DATA_ONLY = os.getenv("LOCAL_DATA_ONLY", "0").strip().lower() in {"1", "true", "yes"}
 
 
 class QuotaExceededError(RuntimeError):
@@ -586,6 +588,7 @@ def cache_status(db_path: Path, city: str = "bangalore") -> dict[str, int | floa
             FROM coverage_tiles AS coverage
             JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
             WHERE coverage.city = ? AND coverage.has_real_data = 1
+              AND coverage.source IN ('opencellid', 'trai')
               AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
               AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
             """,
@@ -1032,6 +1035,9 @@ async def fetch_bbox_towers_live(
         _log(logger, f"[local-towers] returned {len(deduped)} towers for bbox")
         return deduped
 
+    if LOCAL_DATA_ONLY:
+        return []
+
     if key_manager is None and not token.strip():
         raise RuntimeError("OpenCellID token is not configured")
 
@@ -1245,6 +1251,9 @@ async def fetch_tower_chunk(
             f"-> {len(local_towers)} towers",
         )
         return local_towers
+
+    if LOCAL_DATA_ONLY:
+        return []
 
     _log(
         logger,

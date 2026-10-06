@@ -123,6 +123,8 @@ export default function RouteCard({
       <button
         type="button"
         onClick={onClick}
+        aria-label={`${route.label} route`}
+        aria-pressed={isSelected}
         className="w-full text-left"
       >
         <div className="mb-2.5 flex items-start justify-between">
@@ -156,7 +158,7 @@ export default function RouteCard({
           <div className="mb-1 flex items-center justify-between text-xs">
             <div className="flex items-center gap-1.5 text-white/60">
               <Signal className="h-3 w-3" />
-              <span>Coverage</span>
+              <span>Signal estimate</span>
             </div>
             <span className="font-semibold text-white/90">
               {connectivityPercentage}%
@@ -174,6 +176,10 @@ export default function RouteCard({
           </div>
         </div>
       </button>
+
+      <p className="mt-2 break-words text-[11px] text-amber-100/80">{route.signalDataLabel}</p>
+      <p className="mt-1 text-[11px] text-white/60">{Math.round(route.realDataCoveragePercent)}% provider-backed · {Math.round(route.goodSignalPercent)}% good estimate</p>
+      <p className="mt-1 text-[11px] text-white/60">Moving-time ETA estimate · {route.vehicle}</p>
 
       <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3">
         <span className="text-[11px] text-white/45">Route details</span>

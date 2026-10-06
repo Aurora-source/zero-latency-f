@@ -60,6 +60,7 @@ def test_predict_echoes_request_graph_without_changing_scores(prediction, revisi
         prediction["predict_scores"].__globals__,
         {
             "predict_batch_gpu": predictor,
+            "MODEL": object(),
             "MODEL_SOURCE": "synthetic",
             "MODEL_CONFIDENCE": 0.65,
             "USE_GPU": False,

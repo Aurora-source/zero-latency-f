@@ -1,10 +1,29 @@
 param(
     [switch]$ClearCache,
-    [switch]$WhatIf
+    [switch]$WhatIf,
+    [switch]$LocalDataOnly,
+    [string]$RuntimeDir = ".cache/local-runtime",
+    [string]$GraphPath,
+    [string]$TowerCSVPath,
+    [string]$ModelPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+# Shared credential-free local mode also supports Linux/WSL without PowerShell.
+# It uses installed dependencies and separate copies; no dotenv or installer runs.
+if ($LocalDataOnly) {
+    $localRoot = $PSScriptRoot
+    $localPython = Join-Path $localRoot ".venv/Scripts/python.exe"
+    if (-not (Test-Path $localPython)) { $localPython = Join-Path $localRoot ".venv/bin/python" }
+    if (-not (Test-Path $localPython)) { throw "Create the project-local Python 3.11 environment first" }
+    $localArgs = @("--runtime-dir", $RuntimeDir, "--graph", $GraphPath, "--model", $ModelPath)
+    if ($TowerCSVPath) { $localArgs += @("--towers", $TowerCSVPath) }
+    if ($WhatIf) { Write-Host "Would run credential-free local mode: $localPython run-local.py $localArgs"; exit 0 }
+    & $localPython (Join-Path $localRoot "run-local.py") @localArgs
+    exit $LASTEXITCODE
+}
 
 if ($args -contains "--clear-cache") {
     $ClearCache = $true
@@ -575,7 +594,8 @@ Wait-ForHttpJson -Name "data-service" -Url "http://127.0.0.1:8001/health" -Valid
 }
 
 $routingPath = Join-Path $root "services\routing-engine"
-$routingWorkers = if ($env:OS -eq "Windows_NT") { 1 } else { 4 }
+# Graph/score snapshots, single-flight work, and cache locks are process-local.
+$routingWorkers = 1
 Start-ServiceWindow -Name "routing-engine" -ServicePath $routingPath -Port 8002 -PythonExe $pythonExe -VenvActivate $venvActivate -EnvAssignments ($commonEnv + $nonDataSecretOverrides + @("DATA_SERVICE_URL='http://127.0.0.1:8001'", "MAX_RAM_MB='2048'")) -DisableReload -Workers $routingWorkers | Out-Null
 Wait-ForHttpJson -Name "routing-engine" -Url "http://127.0.0.1:8002/health" -Validator {
     param($json)

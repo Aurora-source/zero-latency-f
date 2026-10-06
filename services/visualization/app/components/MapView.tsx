@@ -25,7 +25,6 @@ interface MapViewRequest {
 }
 
 const DEFAULT_CENTER: Coordinates = [20.5937, 78.9629];
-const MAP_VIEWPORT_OFFSET = 0;
 const ROUTE_STYLES: Record<string, { color: string }> = {
   fastest: { color: "#3b82f6" },
   balanced: { color: "#8b5cf6" },
@@ -138,10 +137,12 @@ function VectorTileOverlay({
   city,
   enabled,
   onLoadingChange,
+  onError,
 }: {
   city: string | null;
   enabled: boolean;
   onLoadingChange?: (loading: boolean) => void;
+  onError?: (message: string | null) => void;
 }) {
   const map = useMap();
   const layerRef = useRef<L.Layer | null>(null);
@@ -149,6 +150,7 @@ function VectorTileOverlay({
   useEffect(() => {
     if (!city || !enabled) {
       onLoadingChange?.(false);
+      onError?.(null);
       return undefined;
     }
 
@@ -179,24 +181,26 @@ function VectorTileOverlay({
     );
 
     onLoadingChange?.(true);
+    onError?.(null);
     const stopLoading = () => onLoadingChange?.(false);
+    const tileError = () => { stopLoading(); onError?.("Signal overlay unavailable. Check the data service and toggle heatmap to retry."); };
     const fallbackId = window.setTimeout(stopLoading, 1200);
     vectorLayer.on?.("load", stopLoading);
-    vectorLayer.on?.("tileerror", stopLoading);
+    vectorLayer.on?.("tileerror", tileError);
     vectorLayer.addTo(map);
     layerRef.current = vectorLayer;
 
     return () => {
       window.clearTimeout(fallbackId);
       vectorLayer.off?.("load", stopLoading);
-      vectorLayer.off?.("tileerror", stopLoading);
+      vectorLayer.off?.("tileerror", tileError);
       if (!layerRef.current) return;
 
       map.removeLayer(layerRef.current);
       layerRef.current = null;
       onLoadingChange?.(false);
     };
-  }, [city, enabled, map, onLoadingChange]);
+  }, [city, enabled, map, onLoadingChange, onError]);
 
   return null;
 }
@@ -361,11 +365,11 @@ function MapViewComponent({
 }) {
   const activeCenter = viewRequest?.center ?? DEFAULT_CENTER;
   const [heatmapLoading, setHeatmapLoading] = useState(false);
+  const [heatmapError, setHeatmapError] = useState<string | null>(null);
 
   return (
     <div
       className="relative h-full w-full"
-      style={{ height: `calc(100vh - ${MAP_VIEWPORT_OFFSET}px)` }}
     >
       <MapContainer
         center={activeCenter}
@@ -388,12 +392,8 @@ function MapViewComponent({
           onCoordinatePick={onCoordinatePick}
         />
         <TileLayer
-          url={
-            darkMode
-              ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-              : "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
-          }
-          attribution="&copy; OpenStreetMap contributors"
+          url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
           keepBuffer={2}
         />
 
@@ -402,6 +402,7 @@ function MapViewComponent({
             city={city}
             enabled={showHeatmap}
             onLoadingChange={setHeatmapLoading}
+            onError={setHeatmapError}
           />
         ) : null}
 
@@ -470,6 +471,7 @@ function MapViewComponent({
           Loading signal overlay...
         </div>
       ) : null}
+      {showHeatmap && heatmapError ? <div role="status" className="pointer-events-none absolute right-4 top-72 z-[1000] max-w-xs rounded-xl bg-black/80 p-3 text-xs text-amber-200">{heatmapError}</div> : null}
     </div>
   );
 }

@@ -12,6 +12,7 @@ const apiMocks = vi.hoisted(() => ({
   fetchCityContext: vi.fn(),
   fetchCoverageStatus: vi.fn(),
   fetchHotspotsForViewport: vi.fn(),
+  fetchPredictionReady: vi.fn(),
   fetchRoute: vi.fn(),
   fetchScoreSource: vi.fn(),
   geocodeLocation: vi.fn(),
@@ -82,6 +83,7 @@ async function flushMicrotasks() {
 }
 
 beforeEach(() => {
+  apiMocks.fetchPredictionReady.mockResolvedValue(true);
   apiMocks.fetchCities.mockResolvedValue(["bangalore"]);
   apiMocks.fetchCityContext.mockResolvedValue({
     center: [12.9716, 77.5946],
@@ -136,6 +138,96 @@ afterEach(() => {
 });
 
 describe("App", () => {
+  it("ignores device location received after the user edits the origin", async () => {
+    let finish!: PositionCallback;
+    const original = Object.getOwnPropertyDescriptor(navigator, "geolocation");
+    Object.defineProperty(navigator, "geolocation", { configurable: true, value: {
+      getCurrentPosition: (success: PositionCallback) => { finish = success; },
+    } });
+    try {
+      render(<App />);
+      await waitFor(() => expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3));
+      fireEvent.click(screen.getByRole("button", { name: "Locate my origin" }));
+      const origin = screen.getByRole("textbox", { name: "Origin" });
+      fireEvent.change(origin, { target: { value: "12.98, 77.61" } });
+      await act(async () => finish({ coords: { latitude: 13, longitude: 77.7 } } as GeolocationPosition));
+      expect(origin).toHaveValue("12.98, 77.61");
+      expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3);
+      expect(screen.getByText("Set origin and destination to load routes.")).toBeInTheDocument();
+    } finally {
+      if (original) Object.defineProperty(navigator, "geolocation", original);
+      else Reflect.deleteProperty(navigator, "geolocation");
+    }
+  });
+
+  it("does not let a late city context overwrite edited endpoints", async () => {
+    let finish!: (context: { center: number[]; origin: number[]; destination: number[] }) => void;
+    apiMocks.fetchCityContext.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    render(<App />);
+    await waitFor(() => expect(apiMocks.fetchCityContext).toHaveBeenCalledOnce());
+    fireEvent.change(screen.getByRole("textbox", { name: "Origin" }), { target: { value: "12.98, 77.61" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm origin" }));
+    await act(async () => finish({ center: [12.97, 77.59], origin: [12.97, 77.59], destination: [12.99, 77.62] }));
+    await waitFor(() => expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3));
+    expect(apiMocks.fetchRoute.mock.calls[0][0].origin).toEqual([12.98, 77.61]);
+  });
+  it("clears routes on text edits and ignores a late previous response", async () => {
+    const pending: Array<{ request: RouteRequestPayload; resolve: (route: RouteResponse) => void }> = [];
+    apiMocks.fetchRoute.mockImplementation((request: RouteRequestPayload) => new Promise((resolve) => pending.push({ request, resolve })));
+    render(<App />);
+    await waitFor(() => expect(pending).toHaveLength(3));
+    const oldSignal = apiMocks.fetchRoute.mock.calls[0][1] as AbortSignal;
+    fireEvent.change(screen.getByRole("textbox", { name: "Destination" }), { target: { value: "12.98, 77.62" } });
+    expect(oldSignal.aborted).toBe(true);
+    expect(screen.getByText("Set origin and destination to load routes.")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Confirm destination" }));
+    await waitFor(() => expect(pending).toHaveLength(6));
+    await act(async () => { pending.slice(3).forEach(({ request, resolve }) => resolve({ ...routeFor(request.strategy, request.vehicle, "unknown"), etaMinutes: 7 })); });
+    expect(screen.getAllByText("7.0 min")).toHaveLength(3);
+    await act(async () => { pending.slice(0, 3).forEach(({ request, resolve }) => resolve(routeFor(request.strategy, request.vehicle, "hybrid"))); });
+    expect(screen.getAllByText("7.0 min")).toHaveLength(3);
+    expect(screen.queryByText("18.0 min")).not.toBeInTheDocument();
+  });
+
+  it("ignores a late location search after the user types a new endpoint", async () => {
+    let finish!: (point: [number, number]) => void;
+    apiMocks.geocodeLocation.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    render(<App />);
+    await waitFor(() => expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3));
+    const destination = screen.getByRole("textbox", { name: "Destination" });
+    fireEvent.change(destination, { target: { value: "Old search" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm destination" }));
+    fireEvent.change(destination, { target: { value: "New search" } });
+    await act(async () => finish([13, 77.7]));
+    expect(destination).toHaveValue("New search");
+    expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3);
+  });
+
+  it("bounds pathological loading retries and offers retry", async () => {
+    apiMocks.fetchRoute.mockImplementation(async (request: RouteRequestPayload) => ({ status: "loading", strategy: request.strategy, message: "Loading", retryAfter: 3600 }));
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Retry" })).toBeInTheDocument();
+    expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3);
+    expect(screen.getAllByText(/taking too long/).length).toBeGreaterThan(0);
+  });
+
+  it("shows prediction failure while keeping available routes usable", async () => {
+    apiMocks.fetchPredictionReady.mockRejectedValue(new Error("Offline"));
+    render(<App />);
+    expect(await screen.findByText(/Prediction unavailable/)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Balanced route" })).toBeInTheDocument();
+  });
+
+  it("does not submit blank coordinate components", async () => {
+    render(<App />);
+    await waitFor(() => expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3));
+    fireEvent.change(screen.getByRole("textbox", { name: "Origin" }), { target: { value: ",77.59" } });
+    fireEvent.click(screen.getByRole("button", { name: "Confirm origin" }));
+    expect(await screen.findByText("Enter coordinates as latitude, longitude")).toBeInTheDocument();
+    expect(apiMocks.fetchRoute).toHaveBeenCalledTimes(3);
+    expect(apiMocks.geocodeLocation).not.toHaveBeenCalled();
+  });
+
   it("renders the route workflow and exposes unknown and mixed provenance", async () => {
     render(<App />);
 
@@ -146,6 +238,7 @@ describe("App", () => {
     ).toEqual(["balanced", "connected", "fastest"]);
     expect(apiMocks.fetchRoute).toHaveBeenCalledWith(
       expect.objectContaining({ strategy: "fastest", vehicle: "car" }),
+      expect.any(AbortSignal),
     );
 
     expect(
@@ -157,12 +250,12 @@ describe("App", () => {
     expect(
       await screen.findByText(/Signal data: Hybrid real and estimated data/),
     ).toBeInTheDocument();
-    expect(screen.getByText(/50\.0% real · 75\.0% good signal/)).toBeInTheDocument();
+    expect(screen.getAllByText(/50% provider-backed · 75% good estimate/).length).toBeGreaterThan(0);
 
-    fireEvent.click(screen.getByRole("button", { name: /Fastest/i }));
-    expect(await screen.findByText(/Signal data: ML estimate/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Fastest route" }));
+    expect(await screen.findByText(/Signal data: Model or fallback estimate/)).toBeInTheDocument();
     expect(
-      screen.getByText("Signal data unavailable - using ML estimate"),
+      screen.getByText("Estimated signal; measured coverage is unavailable"),
     ).toBeInTheDocument();
   });
 

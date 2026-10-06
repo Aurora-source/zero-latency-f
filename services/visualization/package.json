@@ -17,6 +17,7 @@
     },
     "devDependencies": {
         "@eslint/js": "^9.39.1",
+        "@playwright/test": "1.58.2",
         "@tailwindcss/vite": "^4.2.2",
         "@testing-library/jest-dom": "^6.9.1",
         "@testing-library/react": "^16.3.0",
@@ -44,6 +45,7 @@
         "preview": "vite preview",
         "typecheck": "tsc --noEmit",
         "lint": "eslint . --max-warnings=0",
-        "test": "vitest"
+        "test": "vitest",
+        "test:e2e": "playwright test"
     }
 }

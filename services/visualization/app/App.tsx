@@ -1,4 +1,6 @@
 import {
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -17,7 +19,6 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import Header from "./components/Header";
-import MapView from "./components/MapView";
 import RouteCard, {
   RouteCardError,
   RouteCardSkeleton,
@@ -38,6 +39,7 @@ import {
   fetchCityContext,
   fetchCoverageStatus,
   fetchHotspotsForViewport,
+  fetchPredictionReady,
   fetchRoute,
   fetchScoreSource,
   formatRouteForUI,
@@ -46,6 +48,8 @@ import {
   preloadCity,
 } from "./lib/api";
 import type { Hotspot } from "./lib/supabase";
+
+const MapView = lazy(() => import("./components/MapView"));
 
 type Coordinates = [number, number];
 type LocationTarget = "origin" | "destination";
@@ -102,8 +106,13 @@ function buildRouteSlots(state: RouteSlotState): Record<Strategy, RouteSlot> {
   };
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
+function sleep(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const finish = () => { window.clearTimeout(timer); signal.removeEventListener("abort", finish); resolve(); };
+    const timer = window.setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
+  });
 }
 
 function formatCityName(city: string) {
@@ -120,14 +129,12 @@ function parseCoordinateInput(value: string): Coordinates | null {
   }
 
   const pieces = value.split(",").map((piece) => piece.trim());
-  if (pieces.length !== 2) {
-    return null;
-  }
+  if (pieces.length !== 2 || pieces.some((piece) => !piece)) throw new Error("Enter coordinates as latitude, longitude");
 
   const lat = Number(pieces[0]);
   const lon = Number(pieces[1]);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    return null;
+    throw new Error("Enter valid latitude and longitude values");
   }
   if (lat < -90 || lat > 90 || lon < -180 || lon > 180) {
     throw new Error("Coordinates must be valid latitude and longitude values");
@@ -136,31 +143,13 @@ function parseCoordinateInput(value: string): Coordinates | null {
   return [lat, lon];
 }
 
-async function reverseGeocode([lat, lon]: Coordinates): Promise<string | null> {
-  try {
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=18&addressdetails=1`,
-      { headers: { "Accept-Language": "en" } },
-    );
-    const data = await response.json();
-    if (data && data.display_name) {
-      const parts = data.display_name.split(",");
-      return parts.slice(0, 3).join(",").trim();
-    }
-  } catch {
-    return null;
-  }
-
-  return null;
-}
-
 function scoreSourceLabel(source: ScoreSourceInfo | null) {
   if (!source) return null;
   if (source.provenanceSource === "trai") return "TRAI India";
   if (source.provenanceSource === "opencellid") return "OpenCellID";
   if (source.provenanceSource === "hybrid") return "Hybrid real and estimated data";
   if (source.provenanceSource === "unknown") return "Unknown provenance";
-  return "ML estimate";
+  return "Model or fallback estimate";
 }
 
 export default function App() {
@@ -195,14 +184,14 @@ export default function App() {
   const [coverageStatus, setCoverageStatus] = useState<CoverageStatusInfo | null>(null);
   const [cityLoadingLabel, setCityLoadingLabel] = useState<string | null>(null);
   const [viewportBounds, setViewportBounds] = useState<ViewportBounds | null>(null);
+  const [predictionReady, setPredictionReady] = useState<boolean | null>(null);
+  const [serviceReloadKey, setServiceReloadKey] = useState(0);
 
   const requestSequence = useRef(0);
+  const routeController = useRef<AbortController | null>(null);
+  const locationControllers = useRef<Partial<Record<LocationTarget, AbortController>>>({});
+  const locationSequence = useRef({ origin: 0, destination: 0 });
   const preloadedCitiesRef = useRef<Set<string>>(new Set());
-  const reverseGeocodeSequence = useRef<Record<LocationTarget, number>>({
-    origin: 0,
-    destination: 0,
-  });
-
   const routes = useMemo(
     () =>
       ROUTE_ORDER.map((strategy) => routeSlots[strategy].route).filter(
@@ -235,28 +224,15 @@ export default function App() {
     setToastMessage(message);
   }, []);
 
-  const queueReverseGeocode = useCallback((target: LocationTarget, coordinates: Coordinates) => {
-    reverseGeocodeSequence.current[target] += 1;
-    const token = reverseGeocodeSequence.current[target];
-    const fallback = formatCoordinates(coordinates);
-
-    void reverseGeocode(coordinates).then((label) => {
-      if (!label) return;
-      if (reverseGeocodeSequence.current[target] !== token) return;
-      if (target === "origin") {
-        setOriginInput((current) => (current === fallback ? label : current));
-        return;
-      }
-      setDestinationInput((current) => (current === fallback ? label : current));
-    });
-  }, []);
-
   const updateLocation = useCallback((
     target: LocationTarget,
     coordinates: Coordinates,
     options?: { label?: string },
   ) => {
     const formatted = formatCoordinates(coordinates);
+    routeController.current?.abort();
+    requestSequence.current += 1;
+    setRouteSlots(buildRouteSlots("idle"));
     const label = options?.label;
 
     if (target === "origin") {
@@ -267,13 +243,7 @@ export default function App() {
       setDestinationInput(label ?? formatted);
     }
 
-    if (label) {
-      reverseGeocodeSequence.current[target] += 1;
-      return;
-    }
-
-    queueReverseGeocode(target, coordinates);
-  }, [queueReverseGeocode]);
+  }, []);
 
   const handleCityHover = useCallback((city: string) => {
     if (city === selectedCity || preloadedCitiesRef.current.has(city)) return;
@@ -300,9 +270,10 @@ export default function App() {
   }, [selectedCity]);
 
   const retryRoutes = useCallback(() => {
+    if (loadingRoutes) return;
     setError("");
     setRouteReloadKey((current) => current + 1);
-  }, []);
+  }, [loadingRoutes]);
 
   const handleRouteSelect = useCallback((routeId: number) => {
     setSelectedRoute(routeId);
@@ -318,6 +289,10 @@ export default function App() {
   const resolveLocationInput = useCallback(async (target: LocationTarget) => {
     const query = (target === "origin" ? originInput : destinationInput).trim();
     if (!query) return;
+    locationControllers.current[target]?.abort();
+    const controller = new AbortController();
+    locationControllers.current[target] = controller;
+    const token = ++locationSequence.current[target];
 
     setActiveLocationTarget(target);
     setResolvingTarget(target);
@@ -332,14 +307,16 @@ export default function App() {
           behavior: "fly",
         });
       } else {
-        const coordinates = await geocodeLocation(query);
+        const coordinates = await geocodeLocation(query, controller.signal);
+        if (controller.signal.aborted || locationSequence.current[target] !== token) return;
         updateLocation(target, coordinates, { label: query });
         setMapViewRequest({ center: coordinates, zoom: LOCATION_ZOOM, behavior: "fly" });
       }
     } catch (err) {
+      if (controller.signal.aborted || locationSequence.current[target] !== token) return;
       showToast(err instanceof Error ? err.message : `Unable to resolve ${target}`);
     } finally {
-      setResolvingTarget((current) => (current === target ? null : current));
+      if (locationSequence.current[target] === token) setResolvingTarget((current) => (current === target ? null : current));
     }
   }, [destinationInput, originInput, showToast, updateLocation]);
 
@@ -354,6 +331,8 @@ export default function App() {
   }, [resolveLocationInput]);
 
   const handleLocateMe = useCallback(() => {
+    locationControllers.current.origin?.abort();
+    const token = ++locationSequence.current.origin;
     setActiveLocationTarget("origin");
 
     if (!navigator.geolocation) {
@@ -363,6 +342,7 @@ export default function App() {
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
+        if (locationSequence.current.origin !== token) return;
         const coordinates: Coordinates = [
           position.coords.latitude,
           position.coords.longitude,
@@ -376,6 +356,7 @@ export default function App() {
         });
       },
       () => {
+        if (locationSequence.current.origin !== token) return;
         showToast("Location access denied");
       },
       {
@@ -389,6 +370,9 @@ export default function App() {
     target: LocationTarget,
     coordinates: Coordinates,
   ) => {
+    locationControllers.current[target]?.abort();
+    locationSequence.current[target] += 1;
+    setResolvingTarget(null);
     setActiveLocationTarget(target);
     updateLocation(target, coordinates);
   }, [updateLocation]);
@@ -402,12 +386,32 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const controllers = locationControllers.current;
+    return () => { Object.values(controllers).forEach((controller) => controller.abort()); routeController.current?.abort(); };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
     fetchCities()
       .then((cities) => {
+        if (cancelled) return;
+        setError("");
         setCityList(cities);
         setSelectedCity((current) => current ?? cities[0] ?? null);
       })
-      .catch((err) => setError(err.message));
+      .catch((err) => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
+  }, [serviceReloadKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const refresh = async () => {
+      try { const ready = await fetchPredictionReady(); if (!cancelled) setPredictionReady(ready); }
+      catch { if (!cancelled) setPredictionReady(false); }
+    };
+    void refresh();
+    const timer = window.setInterval(refresh, 30_000);
+    return () => { cancelled = true; window.clearInterval(timer); };
   }, []);
 
   useEffect(() => {
@@ -459,14 +463,17 @@ export default function App() {
     setDestinationInput("");
     setScoreSource(null);
     setCityLoadingLabel(formatCityName(selectedCity));
+    const locationToken = { ...locationSequence.current };
 
     fetchCityContext(selectedCity)
       .then((context) => {
         if (cancelled) return;
 
-        updateLocation("origin", context.origin);
-        updateLocation("destination", context.destination);
-        setMapViewRequest({
+        const originUnchanged = locationSequence.current.origin === locationToken.origin;
+        const destinationUnchanged = locationSequence.current.destination === locationToken.destination;
+        if (originUnchanged) updateLocation("origin", context.origin);
+        if (destinationUnchanged) updateLocation("destination", context.destination);
+        if (originUnchanged && destinationUnchanged) setMapViewRequest({
           center: context.center,
           zoom: CITY_ZOOM,
           behavior: "fly",
@@ -483,7 +490,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [selectedCity, updateLocation]);
+  }, [selectedCity, updateLocation, serviceReloadKey]);
 
   useEffect(() => {
     if (!showHeatmap || !selectedCity || !viewportBounds) {
@@ -565,11 +572,17 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!selectedCity || !origin || !destination) return undefined;
+    if (!selectedCity || !origin || !destination) {
+      setRouteSlots(buildRouteSlots("idle"));
+      return undefined;
+    }
 
     requestSequence.current += 1;
     const requestId = requestSequence.current;
     let cancelled = false;
+    const controller = new AbortController();
+    routeController.current = controller;
+    const deadline = Date.now() + 10 * 60 * 1000;
 
     setError("");
     setRouteSlots(buildRouteSlots("loading"));
@@ -579,13 +592,14 @@ export default function App() {
     const loadStrategy = async (strategy: Strategy): Promise<RouteLoadResult> => {
       try {
         while (!cancelled && requestId === requestSequence.current) {
+          if (Date.now() >= deadline) throw new Error("The road network is taking too long to load. Retry when the services are ready.");
           const response = await fetchRoute({
             city: selectedCity,
             origin,
             destination,
             strategy,
             vehicle: selectedVehicle,
-          });
+          }, controller.signal);
 
           if (cancelled || requestId !== requestSequence.current) {
             return { status: "cancelled" };
@@ -593,12 +607,13 @@ export default function App() {
 
           if (isRouteLoadingResponse(response)) {
             const retryAfter = Math.max(1, response.retryAfter);
+            if (retryAfter * 1000 > deadline - Date.now()) throw new Error("The road network is taking too long to load. Retry when the services are ready.");
             setPreparingState((current) => ({
               message: `Loading ${formatCityName(selectedCity)} road network... (first time ~60s)`,
               retryAt: Date.now() + retryAfter * 1000,
               startedAt: current?.startedAt ?? Date.now(),
             }));
-            await sleep(retryAfter * 1000);
+            await sleep(retryAfter * 1000, controller.signal);
             continue;
           }
 
@@ -656,8 +671,21 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [selectedCity, origin, destination, selectedVehicle, routeReloadKey]);
+
+  const editLocation = (target: LocationTarget, text: string) => {
+    locationControllers.current[target]?.abort();
+    locationSequence.current[target] += 1;
+    routeController.current?.abort();
+    requestSequence.current += 1;
+    setRouteSlots(buildRouteSlots("idle"));
+    setPreparingState(null);
+    setResolvingTarget(null);
+    if (target === "origin") { setOrigin(undefined); setOriginInput(text); }
+    else { setDestination(undefined); setDestinationInput(text); }
+  };
 
   useEffect(() => {
     if (connectivityWeight < 40) {
@@ -672,8 +700,9 @@ export default function App() {
   }, [connectivityWeight]);
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-black">
+    <div className="relative h-dvh w-full overflow-hidden bg-black">
       <div className="relative h-full">
+        <Suspense fallback={<div className="h-full w-full bg-black text-white" role="status">Loading map…</div>}>
         <MapView
           city={selectedCity}
           origin={origin}
@@ -688,7 +717,9 @@ export default function App() {
           onCoordinatePick={handleMapCoordinatePick}
           onViewportChange={handleViewportChange}
         />
+        </Suspense>
 
+        <div className="[&>div]:gap-2 [&>div>div:first-child]:hidden sm:[&>div>div:first-child]:block">
         <Header
           cities={cityList}
           selectedCity={selectedCity}
@@ -697,8 +728,9 @@ export default function App() {
           onCitySelect={handleCityChange}
           onCityHover={handleCityHover}
         />
+        </div>
 
-        <div className="pointer-events-auto absolute right-0 top-1/2 z-[1200] group flex w-12 -translate-y-1/2 flex-col gap-2 overflow-hidden rounded-l-2xl border border-r-0 border-white/10 bg-black/40 p-2 shadow-2xl backdrop-blur-xl transition-all duration-300 ease-in-out hover:w-32">
+        <div className="pointer-events-auto absolute left-4 right-4 top-[208px] z-[1200] group flex flex-row gap-1 rounded-2xl border border-white/10 bg-black/70 p-2 shadow-2xl backdrop-blur-xl lg:left-auto lg:right-0 lg:top-1/2 lg:w-12 lg:-translate-y-1/2 lg:flex-col lg:gap-2 lg:overflow-hidden lg:rounded-l-2xl lg:rounded-r-none lg:border-r-0 lg:bg-black/40 lg:hover:w-32">
           {VEHICLE_OPTIONS.map((option) => {
             const Icon = option.icon;
             return (
@@ -706,7 +738,9 @@ export default function App() {
                 key={option.id}
                 type="button"
                 onClick={() => setSelectedVehicle(option.id)}
-                className={`flex h-10 w-full shrink-0 items-center gap-3 rounded-xl border px-1.5 transition-colors ${
+                aria-label={option.label}
+                aria-pressed={selectedVehicle === option.id}
+                className={`flex h-10 min-w-0 flex-1 items-center justify-center gap-1 rounded-xl border px-1.5 transition-colors lg:w-full lg:shrink-0 lg:justify-start lg:gap-3 ${
                   selectedVehicle === option.id
                     ? "border-sky-300/70 bg-sky-400/20 text-white"
                     : "border-transparent text-white/70 hover:bg-white/10 hover:text-white"
@@ -715,7 +749,7 @@ export default function App() {
                 <span className="flex w-5 shrink-0 items-center justify-center">
                   <Icon className="h-4 w-4" />
                 </span>
-                <span className="whitespace-nowrap text-xs font-medium tracking-wide opacity-0 transition-opacity duration-300 group-hover:opacity-100">
+                <span className="whitespace-nowrap text-xs font-medium tracking-wide lg:opacity-0 lg:transition-opacity lg:duration-300 lg:group-hover:opacity-100">
                   {option.label}
                 </span>
               </button>
@@ -724,11 +758,11 @@ export default function App() {
         </div>
       </div>
 
-      <div className="pointer-events-auto absolute left-1/2 top-4 z-[1100] w-full max-w-2xl -translate-x-1/2 px-4">
+      <div className="pointer-events-auto absolute left-1/2 top-16 z-[1100] w-full max-w-2xl -translate-x-1/2 px-4 lg:top-4">
         <div className="rounded-2xl border border-white/10 bg-black/40 p-2 shadow-xl backdrop-blur-xl">
-          <div className="flex flex-col gap-2 md:flex-row md:items-center">
+          <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
             <div
-              className={`flex flex-1 items-center gap-2 rounded-xl px-3 py-2 ${
+              className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 ${
                 activeLocationTarget === "origin"
                   ? "bg-white/16 ring-1 ring-blue-400/60"
                   : "bg-white/10"
@@ -748,10 +782,11 @@ export default function App() {
                 type="text"
                 value={originInput}
                 onFocus={() => setActiveLocationTarget("origin")}
-                onChange={(event) => setOriginInput(event.target.value)}
+                onChange={(event) => editLocation("origin", event.target.value)}
                 onKeyDown={(event) => handleLocationKeyDown("origin", event)}
                 placeholder="Search origin or click map..."
-                className="flex-1 bg-transparent text-sm text-white/80 outline-none placeholder:text-white/40"
+                className="min-w-0 flex-1 bg-transparent text-sm text-white/80 outline-none placeholder:text-white/40"
+                aria-label="Origin"
               />
               <button
                 type="button"
@@ -764,10 +799,10 @@ export default function App() {
               </button>
             </div>
 
-            <div className="hidden h-6 w-px bg-white/10 md:block" />
+            <div className="hidden h-6 w-px bg-white/10 lg:block" />
 
             <div
-              className={`flex flex-1 items-center gap-2 rounded-xl px-3 py-2 ${
+              className={`flex min-w-0 flex-1 items-center gap-2 rounded-xl px-3 py-2 ${
                 activeLocationTarget === "destination"
                   ? "bg-white/16 ring-1 ring-emerald-400/60"
                   : "bg-white/10"
@@ -778,10 +813,11 @@ export default function App() {
                 type="text"
                 value={destinationInput}
                 onFocus={() => setActiveLocationTarget("destination")}
-                onChange={(event) => setDestinationInput(event.target.value)}
+                onChange={(event) => editLocation("destination", event.target.value)}
                 onKeyDown={(event) => handleLocationKeyDown("destination", event)}
                 placeholder="Search destination or click map..."
-                className="flex-1 bg-transparent text-sm text-white/80 outline-none placeholder:text-white/40"
+                className="min-w-0 flex-1 bg-transparent text-sm text-white/80 outline-none placeholder:text-white/40"
+                aria-label="Destination"
               />
               <button
                 type="button"
@@ -797,14 +833,15 @@ export default function App() {
         </div>
       </div>
 
-      <div className="pointer-events-none absolute bottom-8 left-4 top-20 z-20 flex w-[380px] flex-col gap-3">
+      <div className="pointer-events-none absolute bottom-4 left-4 right-4 z-[1050] flex max-h-[43dvh] flex-col gap-2 lg:bottom-8 lg:right-auto lg:top-20 lg:max-h-none lg:w-[380px] lg:gap-3">
         <div className="pointer-events-auto shrink-0 rounded-2xl border border-white/10 bg-black/30 p-4 shadow-xl backdrop-blur-xl">
-          <h3 className="mb-4 text-sm text-white">Routing Priority</h3>
+          <h3 className="mb-2 text-sm text-white lg:mb-4">Routing Priority</h3>
           <ConnectivitySlider value={connectivityWeight} onChange={setConnectivityWeight} />
         </div>
 
         <div className="pointer-events-auto flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-white/10 bg-black/30 p-4 shadow-xl backdrop-blur-xl">
           <h3 className="mb-3 shrink-0 text-sm text-white">Available Routes</h3>
+          {predictionReady === false ? <p role="status" className="mb-2 text-xs text-amber-200">Prediction unavailable: routes may use retained or neutral estimates.</p> : null}
 
           {cityLoadingLabel ? (
             <div className="mb-3 shrink-0 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs text-white/75">
@@ -883,7 +920,7 @@ export default function App() {
       </div>
 
       {selectedRouteData?.warning ? (
-        <div className="pointer-events-none absolute bottom-10 left-1/2 z-[1300] w-full max-w-md -translate-x-1/2 px-4">
+        <div className="pointer-events-none absolute bottom-10 left-1/2 z-[1300] hidden w-full max-w-md -translate-x-1/2 px-4 lg:block">
           <div className="pointer-events-auto rounded-2xl border border-amber-500/30 bg-black/70 p-4 shadow-2xl backdrop-blur-xl">
             <div className="flex items-center justify-center gap-3">
               <AlertTriangle className="h-5 w-5 shrink-0 text-amber-400" />
@@ -895,12 +932,14 @@ export default function App() {
         </div>
       ) : null}
 
-      <div className="absolute bottom-10 right-4 z-20 space-y-3">
+      <div className="absolute right-4 top-[276px] z-[1040] max-w-[calc(100%-2rem)] space-y-3 lg:bottom-10 lg:top-auto lg:max-w-md">
         <div className="flex items-center gap-3 rounded-xl border border-white/10 bg-black/30 px-3 py-2 backdrop-blur-xl">
           <span className="text-sm text-white">Heatmap</span>
           <button
             type="button"
             onClick={() => setShowHeatmap((current) => !current)}
+            aria-label="Toggle heatmap"
+            aria-pressed={showHeatmap}
             className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 focus:outline-none ${
               showHeatmap ? "bg-blue-500" : "bg-white/20"
             }`}
@@ -913,11 +952,11 @@ export default function App() {
           </button>
         </div>
 
-        <Legend />
+        <div className="hidden lg:block"><Legend /></div>
 
         {selectedRouteData?.signalDataLabel || scoreSource ? (
           <div
-            className={`rounded-xl border px-3 py-2 text-xs backdrop-blur-xl ${
+            className={`hidden rounded-xl border px-3 py-2 text-xs backdrop-blur-xl lg:block ${
               activeRealDataCoveragePercent > 0
                 ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-100"
                 : "border-amber-300/30 bg-amber-500/10 text-amber-100"
@@ -925,7 +964,7 @@ export default function App() {
           >
             Signal data: {selectedRouteData?.signalDataLabel ?? scoreSourceLabel(scoreSource)}
             <span className="ml-2 text-[11px] opacity-80">
-              {activeRealDataCoveragePercent.toFixed(1)}% real · {activeGoodSignalPercent.toFixed(1)}% good signal
+              {Math.round(activeRealDataCoveragePercent)}% provider-backed · {Math.round(activeGoodSignalPercent)}% good estimate
             </span>
           </div>
         ) : null}
@@ -933,6 +972,7 @@ export default function App() {
         {error ? (
           <div className="rounded-xl border border-rose-300/30 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
             {error}
+            {!hasRouteInputs ? <button type="button" onClick={() => setServiceReloadKey((value) => value + 1)} className="ml-2 underline">Retry services</button> : null}
           </div>
         ) : null}
       </div>

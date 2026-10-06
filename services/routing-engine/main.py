@@ -46,7 +46,7 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 SCORE_REFRESH_SECONDS = 60
 ROUTE_CACHE_TTL_SECONDS = 10 * 60
 ROUTE_CACHE_MAX_ENTRIES = 200
-ROUTE_CACHE_SCHEMA_VERSION = 7
+ROUTE_CACHE_SCHEMA_VERSION = 8
 GRAPH_LOAD_MAX_ATTEMPTS = 3
 GRAPH_LOAD_RETRY_SECONDS = 5
 GRAPH_PUBLICATION_WAIT_SECONDS = 10 * 60
@@ -63,7 +63,7 @@ CITY_PLACE_QUERIES: dict[str, str] = {
 }
 CPU_CORES = max(1, os.cpu_count() or 1)
 THREAD_POOL = ThreadPoolExecutor(
-    max_workers=CPU_CORES,
+    max_workers=max(1, int(os.getenv("ROUTING_THREADS", str(CPU_CORES)))),
     thread_name_prefix="routing_worker",
 )
 CITY_LOCKS = defaultdict(Lock)
@@ -1859,7 +1859,10 @@ async def preload_city_graph(city: str) -> None:
 def validate_point(name: str, point: list[float]) -> tuple[float, float]:
     if len(point) != 2:
         raise HTTPException(status_code=422, detail=f"{name} must contain [lat, lon].")
-    return float(point[0]), float(point[1])
+    lat, lon = float(point[0]), float(point[1])
+    if not math.isfinite(lat) or not math.isfinite(lon) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise HTTPException(status_code=422, detail=f"{name} must contain valid latitude and longitude.")
+    return lat, lon
 
 
 def resolve_edge(graph, u: int, v: int, weights_cpu: np.ndarray):
@@ -2167,7 +2170,7 @@ def push_corridor_scores_to_tiles(
         with request.urlopen(feedback_request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
         print(
-            f"[tiles] applied corridor real-score feedback "
+            f"[tiles] applied corridor score feedback "
             f"({int(payload.get('updated_edges') or 0)} edges)"
         )
     except Exception as exc:
@@ -2436,7 +2439,7 @@ def compute_route_from_snapshot(
         )
         route_provenance.append(provenance_source)
         route_real_data.append(
-            is_real_override or base_provenance_source != PROVENANCE_ML_SYNTHETIC
+            provenance_source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
         )
         if is_real_override:
             route_score_payload[segment_id] = round(score, 3)
@@ -2509,6 +2512,8 @@ def compute_route_from_snapshot(
     ) if route_provenance else 0.0
     route_source_set = set(route_provenance)
     if not route_source_set:
+        signal_source = PROVENANCE_UNKNOWN
+    elif PROVENANCE_UNKNOWN in route_source_set:
         signal_source = PROVENANCE_UNKNOWN
     elif 0 < real_edge_count < len(route_real_data):
         signal_source = PROVENANCE_HYBRID

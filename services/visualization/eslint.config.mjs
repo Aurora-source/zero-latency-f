@@ -8,6 +8,8 @@ const activeTypeScriptFiles = [
   "tests/**/*.{ts,tsx}",
   "vite.config.ts",
   "vitest.config.ts",
+  "playwright.config.ts",
+  "e2e/**/*.ts",
 ];
 
 export default tseslint.config(
@@ -47,7 +49,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ["vite.config.ts", "vitest.config.ts"],
+    files: ["vite.config.ts", "vitest.config.ts", "playwright.config.ts", "e2e/**/*.ts"],
     languageOptions: {
       globals: globals.node,
     },

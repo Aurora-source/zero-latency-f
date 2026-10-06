@@ -91,6 +91,32 @@ def assert_no_route(routing, operation):
     assert error.value.detail == routing["NO_ROUTE_DETAIL"]
 
 
+@pytest.mark.parametrize("corridor_override", [False, True])
+def test_unknown_tower_estimates_are_never_counted_as_real_coverage(routing, monkeypatch, corridor_override):
+    graph = graph_with_nodes()
+    add_edge(graph, 0, 3, provenance_source="unknown", connectivity_score=0.8)
+    state = prepare(routing, graph)
+    if corridor_override:
+        monkeypatch.setitem(routing, "fetch_corridor_scores", lambda *args: (
+            {"0-3-0": 0.9}, "unknown", 1, 0, 100, {"0-3-0": "unknown"}, "corridor-unknown",
+        ))
+    result = route(routing, state)
+    assert result["provenance_source"] == "unknown"
+    assert result["real_data_coverage_percent"] == 0.0
+    assert result["total_time_min"] == 1.0
+    assert result["signal_segments"][0]["provenance_source"] == "unknown"
+
+
+def test_unknown_neighbor_does_not_turn_route_provenance_into_hybrid(routing):
+    graph = graph_with_nodes()
+    add_edge(graph, 0, 1, provenance_source="unknown")
+    add_edge(graph, 1, 3, provenance_source="trai")
+    result = route(routing, prepare(routing, graph))
+    assert result["provenance_source"] == "unknown"
+    assert result["real_data_coverage_percent"] == 50.0
+    assert result["total_time_min"] == 2.0
+
+
 def test_fastest_uses_vehicle_seconds_even_when_longer(routing):
     graph = graph_with_nodes()
     for u, v in ((0, 1), (1, 3)):
@@ -234,6 +260,18 @@ def test_speed_units_and_fallbacks_have_independent_expected_seconds(routing, ra
     add_edge(graph, 0, 1, speed_kph=raw, travel_time=1)
     state = prepare(routing, graph)
     assert route(routing, state, destination=1)["total_time_min"] == round(60 / expected_kph, 1)
+
+
+@pytest.mark.parametrize("point", [[91, 77], [-91, 77], [12, 181], [12, -181], [math.nan, 77], [12, math.inf], [], [12], [12, 77, 0]])
+def test_invalid_coordinates_rejected_before_snapping(routing, point):
+    with pytest.raises(routing["HTTPException"]) as caught:
+        routing["validate_point"]("origin", point)
+    assert caught.value.status_code == 422
+
+
+def test_coordinate_boundaries_are_valid(routing):
+    assert routing["validate_point"]("origin", [-90, -180]) == (-90, -180)
+    assert routing["validate_point"]("destination", [90, 180]) == (90, 180)
 
 
 def test_speed_limits_and_directional_limits_bound_vehicle_speeds(routing):

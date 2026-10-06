@@ -729,6 +729,7 @@ class DataScoreMergeTests(unittest.TestCase):
 
         self.assertEqual(metadata["real_data_source"], "unknown")
         self.assertEqual(metadata["source"], "unknown")
+        self.assertEqual(metadata["real_data_coverage_percent"], 50.0)
         self.assertEqual(edge_sources["boundary"], "unknown")
 
     def test_adjacent_empty_tile_does_not_erase_boundary_tower_score(self) -> None:
@@ -1499,12 +1500,12 @@ class FrontendRegressionTests(unittest.TestCase):
         data_dockerfile = DATA_DOCKERFILE.read_text(encoding="utf-8")
 
         self.assertNotIn("driver: nvidia", compose)
-        self.assertTrue(prediction_dockerfile.startswith("FROM python:3.11-slim"))
-        self.assertTrue(routing_dockerfile.startswith("FROM python:3.11-slim"))
+        self.assertTrue(prediction_dockerfile.startswith("FROM python:3.11.16-slim-bookworm"))
+        self.assertTrue(routing_dockerfile.startswith("FROM python:3.11.16-slim-bookworm"))
         self.assertTrue(
             (REPO_ROOT / "services" / "visualization" / "Dockerfile")
             .read_text(encoding="utf-8")
-            .startswith("FROM node:20.19-alpine")
+            .startswith("FROM node:22.23.2-bookworm-slim@sha256:")
         )
         self.assertNotIn(
             "--configLoader native",
@@ -1545,7 +1546,9 @@ class FrontendRegressionTests(unittest.TestCase):
         compose = COMPOSE_FILE.read_text(encoding="utf-8")
         for port in (8001, 8002, 8003):
             self.assertIn(f"http://127.0.0.1:{port}/ready", compose)
-        self.assertGreaterEqual(compose.count("condition: service_healthy"), 6)
+        self.assertEqual(compose.count("condition: service_healthy"), 2)
+        # The static gateway starts immediately; downstream graph work is gated.
+        self.assertIn("http://127.0.0.1:8080/api/ready/routing", compose)
 
         for service_main in (DATA_MAIN, ROUTING_MAIN, PREDICTION_MAIN):
             source = service_main.read_text(encoding="utf-8")

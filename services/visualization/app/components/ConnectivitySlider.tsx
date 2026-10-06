@@ -27,7 +27,7 @@ export default function ConnectivitySlider({ value, onChange }: ConnectivitySlid
           <span>Fastest</span>
         </div>
         <div className="flex items-center gap-1.5">
-          <span>Best Coverage</span>
+          <span>Signal Priority</span>
           <Radio className="w-3.5 h-3.5 text-green-400" />
         </div>
       </div>
@@ -48,6 +48,9 @@ export default function ConnectivitySlider({ value, onChange }: ConnectivitySlid
         {["fast", "balanced", "connected"].map((m, i) => (
           <button
             key={m}
+            type="button"
+            aria-label={`${m === "fast" ? "Fastest" : m.charAt(0).toUpperCase() + m.slice(1)} priority`}
+            aria-pressed={index === i}
             onClick={() => setMode(m)}
             className={`flex-1 py-2 text-xs font-medium z-10 ${
               index === i ? "text-black" : "text-white/50"
@@ -64,7 +67,7 @@ export default function ConnectivitySlider({ value, onChange }: ConnectivitySlid
           <span className="text-xs font-semibold text-white/90">
             {mode === "fast" && "Speed Priority"}
             {mode === "balanced" && "Balanced"}
-            {mode === "connected" && "Coverage Priority"}
+            {mode === "connected" && "Signal Priority"}
           </span>
         </div>
       </div>

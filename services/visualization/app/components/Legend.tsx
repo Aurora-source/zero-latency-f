@@ -2,15 +2,15 @@ import { SignalHigh, SignalMedium, SignalLow } from 'lucide-react';
 
 export default function Legend() {
   const signalLevels = [
-    { label: 'Strong Signal', color: '#10b981' },
-    { label: 'Medium Signal', color: '#fbbf24' },
-    { label: 'Weak Signal', color: '#ef4444' }
+    { label: 'High estimate', color: '#10b981' },
+    { label: 'Medium estimate', color: '#fbbf24' },
+    { label: 'Low estimate', color: '#ef4444' }
   ];
 
   return (
     <div className="bg-black/35 backdrop-blur-xl rounded-2xl border border-white/10 shadow-lg p-3">
       <h4 className="text-white/90 font-semibold text-xs mb-2.5">
-        Signal Strength
+        Signal estimate
       </h4>
 
       <div className="space-y-2">

@@ -28,7 +28,7 @@ import mapbox_vector_tile
 import mercantile
 import numpy as np
 import osmnx as ox
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -43,7 +43,9 @@ if str(SERVICE_DIR) not in sys.path:
     sys.path.insert(0, str(SERVICE_DIR))
 
 from api_key_manager import APIKeyManager
+from geocoding import search_place
 from tile_loader import (
+    LOCAL_DATA_ONLY,
     TILE_STALE_SECONDS,
     cache_status as persistent_cache_status,
     cached_towers_for_bbox,
@@ -134,10 +136,12 @@ MAX_TILE_ZOOM = 16
 MVT_LAYER_NAME = "roads"
 MVT_MEDIA_TYPE = "application/vnd.mapbox-vector-tile"
 ROAD_FALLBACK_SCORE = 0.05
-OPENCELLID_TOKEN = os.getenv("OPENCELLID_TOKEN", "").strip()
+OPENCELLID_TOKEN = "" if LOCAL_DATA_ONLY else os.getenv("OPENCELLID_TOKEN", "").strip()
 OPENCELLID_MAX_BBOX_AREA_M2 = 4_000_000.0
 OPENCELLID_CHUNK_SIDE_KM = 1.8
 CORRIDOR_CACHE_TTL = 600
+CORRIDOR_CACHE_MAX_ENTRIES = 32
+CORRIDOR_CACHE_MAX_TOWERS = 100_000
 GRAPH_LOAD_MAX_ATTEMPTS = 3
 GRAPH_LOAD_RETRY_BACKOFF_SECONDS = (5.0, 10.0)
 DATA_DIR = SERVICE_DIR / "data"
@@ -626,7 +630,10 @@ def load_real_scores(city: str, state: CityState) -> tuple[np.ndarray, dict[str,
             (observed / max(len(state.segments), 1)) * 100.0,
             1,
         )
-    if real_coverage <= 0.0:
+    if real_source not in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}:
+        real_coverage = 0.0
+        aggregate_source = PROVENANCE_UNKNOWN
+    elif real_coverage <= 0.0:
         aggregate_source = PROVENANCE_ML_SYNTHETIC
     elif real_coverage < 100.0:
         aggregate_source = PROVENANCE_HYBRID
@@ -642,7 +649,7 @@ def load_real_scores(city: str, state: CityState) -> tuple[np.ndarray, dict[str,
     )
     metadata.setdefault("tower_count", 0)
 
-    print(f"[scores] Loaded REAL TRAI/tower scores for {city}")
+    print(f"[scores] Loaded stored scores for {city} (source={real_source})")
     print("[scores] Score distribution:")
     print(f"  Dead zones: {summary['dead']} ({summary['dead_zone_percent']:.1f}%)")
     print(
@@ -671,7 +678,7 @@ def score_provenance_summary(state: CityState) -> tuple[str, str, float]:
         for segment_id in state.segment_lookup
         if segment_id in state.real_score_sources
     ]
-    real_count = len(real_sources)
+    real_count = sum(source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI} for source in real_sources)
     total_count = len(state.segments)
     real_coverage = round((real_count / max(total_count, 1)) * 100.0, 1)
     known_sources = {
@@ -688,8 +695,10 @@ def score_provenance_summary(state: CityState) -> tuple[str, str, float]:
         if all_sources_known and len(known_sources) == 1
         else PROVENANCE_UNKNOWN
     )
-    if real_count == 0:
+    if not real_sources:
         aggregate_source = PROVENANCE_ML_SYNTHETIC
+    elif not all_sources_known:
+        aggregate_source = PROVENANCE_UNKNOWN
     elif real_count < total_count:
         aggregate_source = PROVENANCE_HYBRID
     else:
@@ -773,6 +782,7 @@ def cached_coverage_metadata(city: str) -> dict[str, Any] | None:
                     FROM coverage_tiles AS coverage
                     JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
                     WHERE coverage.city = ? AND coverage.has_real_data = 1
+                      AND coverage.source IN ('opencellid', 'trai')
                       AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
                       AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
                     """,
@@ -785,6 +795,7 @@ def cached_coverage_metadata(city: str) -> dict[str, Any] | None:
                 FROM coverage_tiles AS coverage
                 JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
                 WHERE coverage.city = ? AND coverage.has_real_data = 1
+                  AND coverage.source IN ('opencellid', 'trai')
                   AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
                   AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
                 """,
@@ -801,6 +812,7 @@ def cached_coverage_metadata(city: str) -> dict[str, Any] | None:
                     JOIN tiles AS t ON t.tile_id = map.tile_id
                     JOIN coverage_tiles AS coverage ON coverage.tile_id = t.tile_id
                     WHERE t.city = ? AND coverage.has_real_data = 1
+                      AND coverage.source IN ('opencellid', 'trai')
                       AND t.is_cached = 1 AND t.last_updated IS NOT NULL
                       AND CAST(strftime('%s', t.last_updated) AS INTEGER) >= ?
                     """,
@@ -1047,6 +1059,30 @@ def queue_missing_tower_tiles(tile_ids: list[str]) -> int:
     return TOWER_WORKER.enqueue_tiles(tile_ids)
 
 
+def cache_corridor_towers(
+    key: tuple[float, float, float, float],
+    towers: list[dict[str, Any]],
+    source: str,
+) -> None:
+    """Bound retained tower lists; eviction never changes the current response."""
+    now = time.time()
+    with CORRIDOR_CACHE_LOCK:
+        for existing_key, entry in list(CORRIDOR_CACHE.items()):
+            if now - entry[1] >= CORRIDOR_CACHE_TTL:
+                CORRIDOR_CACHE.pop(existing_key, None)
+        CORRIDOR_CACHE.pop(key, None)
+        if len(towers) > CORRIDOR_CACHE_MAX_TOWERS:
+            return  # Serve a large corridor without retaining its records.
+        retained = sum(len(entry[0]) for entry in CORRIDOR_CACHE.values())
+        while CORRIDOR_CACHE and (
+            len(CORRIDOR_CACHE) >= CORRIDOR_CACHE_MAX_ENTRIES
+            or retained + len(towers) > CORRIDOR_CACHE_MAX_TOWERS
+        ):
+            oldest_key = next(iter(CORRIDOR_CACHE))
+            retained -= len(CORRIDOR_CACHE.pop(oldest_key)[0])
+        CORRIDOR_CACHE[key] = (towers, now, True, source)
+
+
 async def _fetch_towers_cached(
     origin_lat: float,
     origin_lon: float,
@@ -1130,8 +1166,7 @@ async def _fetch_towers_cached(
             )
             if towers:
                 live_source = tower_provenance_source()
-                with CORRIDOR_CACHE_LOCK:
-                    CORRIDOR_CACHE[key] = (towers, time.time(), True, live_source)
+                cache_corridor_towers(key, towers, live_source)
                 metadata = corridor_coverage_metadata(
                     towers,
                     [],
@@ -1193,6 +1228,8 @@ def live_tower_fetch_available() -> bool:
     local_status = local_tower_source_status()
     if local_status.get("loaded") and int(local_status.get("count") or 0) > 0:
         return True
+    if LOCAL_DATA_ONLY:
+        return False
     if OPENCELLID_TOKEN:
         return True
     if API_KEY_MANAGER is None:
@@ -1210,13 +1247,6 @@ def corridor_coverage_metadata(
     live_full_bbox: bool = False,
     live_source: str | None = None,
 ) -> dict[str, Any]:
-    if live_full_bbox and towers:
-        real_coverage = 100.0
-    else:
-        real_coverage = round(
-            (len(covered_tile_ids) / max(len(query_tiles), 1)) * 100.0,
-            1,
-        ) if query_tiles else 0.0
     tile_sources = coverage_sources_for_tiles(TOWER_CACHE_DB_PATH, covered_tile_ids)
     stored_sources = {
         canonical_provenance(tile_sources.get(tile_id))
@@ -1235,7 +1265,15 @@ def corridor_coverage_metadata(
         real_source = next(iter(stored_sources))
     else:
         real_source = PROVENANCE_UNKNOWN
-    if real_coverage <= 0.0:
+    # A legacy/local record without provider evidence can inform an estimate,
+    # but cannot establish real-data coverage merely by being present.
+    known_sources = {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+    if live_full_bbox:
+        real_coverage = 100.0 if towers and real_source in known_sources else 0.0
+    else:
+        known_tiles = sum(canonical_provenance(tile_sources.get(tile)) in known_sources for tile in covered_tile_ids)
+        real_coverage = round(100.0 * known_tiles / max(len(query_tiles), 1), 1)
+    if real_coverage <= 0.0 or real_source == PROVENANCE_UNKNOWN:
         aggregate_source = PROVENANCE_UNKNOWN
     elif real_coverage < 100.0:
         aggregate_source = PROVENANCE_HYBRID
@@ -1989,6 +2027,11 @@ def load_or_fetch_graph(city: str):
         print("[graph] local graph loaded")
         return local_graph
 
+    if LOCAL_DATA_ONLY:
+        raise GraphLoadTransientError(
+            f"Local graph unavailable for {city_slug}; LOCAL_DATA_ONLY disables graph downloads"
+        )
+
     print(f"[graph] Loading Bangalore graph (cached: no)")
     overpass_urls = configured_overpass_urls()
     configure_osmnx_request_settings(overpass_urls[0])
@@ -2270,7 +2313,7 @@ def update_corridor_tiles(
         for tile_key in state.edge_tile_map.get(edge_id, set())
     }
     print(
-        f"[tiles] applied corridor real scores for {len(valid_scores)} edges "
+        f"[tiles] applied corridor scores for {len(valid_scores)} edges "
         f"({len(invalidated)} affected tiles)"
     )
     return len(valid_scores)
@@ -2695,6 +2738,7 @@ def safe_cache_status_payload(city: str | None = None) -> dict[str, Any]:
                     FROM coverage_tiles AS coverage
                     JOIN tiles AS tile ON tile.tile_id = coverage.tile_id
                     WHERE coverage.city = ? AND coverage.has_real_data = 1
+                      AND coverage.source IN ('opencellid', 'trai')
                       AND tile.is_cached = 1 AND tile.last_updated IS NOT NULL
                       AND CAST(strftime('%s', tile.last_updated) AS INTEGER) >= ?
                     """,
@@ -2722,6 +2766,10 @@ def safe_cache_status_payload(city: str | None = None) -> dict[str, Any]:
 
 def start_tower_worker_if_available() -> bool:
     global TOWER_WORKER
+
+    if LOCAL_DATA_ONLY:
+        print("[startup] LOCAL_DATA_ONLY: background ingestion disabled; local towers queried on demand")
+        return False
 
     local_towers_ready = bool(LOCAL_TOWER_INDEX and int(LOCAL_TOWER_INDEX.get("count") or 0) > 0)
     key_status = API_KEY_MANAGER.status() if API_KEY_MANAGER is not None else {"total_keys": 0}
@@ -2755,7 +2803,7 @@ def startup_event() -> None:
     OSMNX_HTTP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     load_local_towers()
     initialize_tower_cache()
-    if API_KEY_MANAGER is None:
+    if API_KEY_MANAGER is None and not LOCAL_DATA_ONLY:
         API_KEY_MANAGER = APIKeyManager(
             env_path=ENV_FILE_PATH,
             state_path=API_KEY_STATE_PATH,
@@ -2903,6 +2951,11 @@ def score_source_payload(state: CityState) -> dict[str, Any]:
             "%Y-%m-%d", time.gmtime(scores_updated_at)
         ) if scores_updated_at else ""
     return metadata
+
+
+@app.get("/geocode")
+async def geocode(q: str = Query(min_length=3, max_length=200)) -> dict[str, Any]:
+    return await search_place(q)
 
 
 @app.get("/scores/{city}")
@@ -3120,10 +3173,16 @@ async def _calculate_corridor_scores(payload: CorridorScoresRequest) -> dict[str
         if real_edge_sources.get(edge_id, PROVENANCE_UNKNOWN) == PROVENANCE_UNKNOWN:
             real_edge_sources[edge_id] = real_source
     total_edges = len(payload.edge_coords)
-    real_edges = len(real_edge_coords)
+    observed_edges = len(real_edge_coords)
+    real_edges = sum(
+        source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        for source in real_edge_sources.values()
+    )
     real_coverage = round((real_edges / max(total_edges, 1)) * 100.0, 1) if total_edges else 0.0
-    if real_edges <= 0:
+    if observed_edges <= 0:
         source = PROVENANCE_ML_SYNTHETIC
+    elif real_edges < observed_edges:
+        source = PROVENANCE_UNKNOWN
     elif real_edges < total_edges:
         source = PROVENANCE_HYBRID
     else:

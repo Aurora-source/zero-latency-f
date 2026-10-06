@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   fetchRoute,
+  geocodeLocation,
   formatRouteForUI,
   isRouteLoadingResponse,
   type RouteRequestPayload,
@@ -29,7 +30,45 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it("allows the geocoder timeout response to preserve its map fallback message", async () => {
+  vi.useFakeTimers();
+  vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation((_url, init) => new Promise((resolve, reject) => {
+    init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+    window.setTimeout(() => resolve(jsonResponse({ detail: "Place search unavailable. Enter latitude, longitude or pick the map." }, { status: 503 })), 10_250);
+  })));
+  const response = expect(geocodeLocation("MG Road Bengaluru")).rejects.toThrow("pick the map");
+  await vi.advanceTimersByTimeAsync(10_250);
+  await response;
+});
+
 describe("fetchRoute", () => {
+  it.each([
+    {},
+    { path_geojson: { type: "LineString", coordinates: [] }, total_time_min: 0, avg_connectivity: 0 },
+    { path_geojson: { type: "LineString", coordinates: [[77.59, 91], [77.6, 12.98]] }, total_time_min: 1, avg_connectivity: 0.5 },
+    { path_geojson: { type: "LineString", coordinates: [[77.59, 12.97], [77.6, 12.98]] }, total_time_min: null, avg_connectivity: 0.5 },
+  ])("rejects malformed success payloads", async (body) => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(body, { status: 200 })));
+    await expect(fetchRoute(payload)).rejects.toThrow("invalid route");
+  });
+
+  it("bounds a hung route request and aborts the transport", async () => {
+    vi.useFakeTimers();
+    let aborted = false;
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockImplementation((_url, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener("abort", () => { aborted = true; reject(new DOMException("Aborted", "AbortError")); });
+    })));
+    const response = expect(fetchRoute(payload)).rejects.toThrow("timed out");
+    await vi.advanceTimersByTimeAsync(90_000);
+    await response;
+    expect(aborted).toBe(true);
+  });
+
+  it("does not expose a proxy HTML error", async () => {
+    vi.stubGlobal("fetch", vi.fn<typeof fetch>().mockResolvedValue(new Response("<html>internal proxy traceback</html>", { status: 502 })));
+    await expect(fetchRoute(payload)).rejects.toThrow("Route request failed");
+  });
+
   it("honors Retry-After delta seconds for a 202 loading response", async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse(
@@ -196,7 +235,7 @@ describe("fetchRoute", () => {
     "keeps vehicle=%s distinct in the request and response",
     async (vehicle) => {
       const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
-        jsonResponse({ vehicle, path_geojson: { type: "LineString", coordinates: [] } }, { status: 200 }),
+        jsonResponse({ vehicle, total_time_min: 10, avg_connectivity: 0.5, path_geojson: { type: "LineString", coordinates: [[77.59, 12.97], [77.60, 12.98]] } }, { status: 200 }),
       );
       vi.stubGlobal("fetch", fetchMock);
 
@@ -210,7 +249,7 @@ describe("fetchRoute", () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse(
         {
-          path_geojson: { type: "LineString", coordinates: [] },
+          path_geojson: { type: "LineString", coordinates: [[77.59, 12.97], [77.60, 12.98]] },
           signal_source: "unrecognized-provider",
           total_time_min: 0,
           avg_connectivity: 0,

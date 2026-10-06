@@ -1,5 +1,34 @@
 # API contract
 
+## Production gateway (Phase 2E)
+
+The production image serves the compiled SPA and relative `/api` requests from
+one origin. Only `127.0.0.1:8080` is published by default; backend ports are
+internal. Gateway `/healthz` indicates liveness, while its container health check
+requires prediction, data and routing `/api/ready/*` responses to succeed.
+The frontend remains available during warmup. Upstream connection/timeout failures
+return JSON HTTP 503 with a short retry hint; backend HTTP 202/loading and
+revision errors retain their documented semantics.
+
+The proxy allowlist covers this application's endpoints, not arbitrary service
+paths. Unknown `/api/*` paths return 404. Bodies, including public prediction
+batches, are limited to 1 MiB; the large internal data-to-prediction batch uses
+the service network directly. Proxy connect/read timeouts are 3/90 seconds.
+Production CORS defaults to no cross-origin
+access; optional `CORS_ORIGINS` must name explicit HTTP origins. Forwarded
+client headers are replaced at the gateway and are not trusted by backend Uvicorn.
+
+Route coordinates must contain exactly two finite latitude/longitude values
+within [-90, 90] and [-180, 180]. Invalid points return 422 before loading or
+snapping to a road. Valid geographic coordinates outside the graph's region
+still use the existing nearest-node behavior; this is not evidence of coverage
+or legal access outside the supplied map.
+
+Production requires checksum-validated immutable graph/tower/model inputs,
+disables ingestion and training, and retains one process per Python service.
+Graph publication is writable only by data; routing mounts it read-only.
+Unknown tower/model provenance remains unknown.
+
 This document defines the Phase 1 HTTP contract used by the authoritative frontend in
 `services/visualization`. Public browser requests use the `/api` prefix through the
 gateway. Service-to-service requests use the same paths without `/api` on the target
@@ -146,7 +175,7 @@ available). Score refresh publishes copied graph/weight/provenance state only if
 the target graph and expected previous score generation are still current. A late
 reply cannot update a replacement graph or overwrite a later score generation.
 
-Route-cache schema 7 accounts for graph and city-score identities, corridor-score
+Route-cache schema 8 accounts for graph and city-score identities, corridor-score
 identity, endpoints, vehicle, mode, and the captured day/night bucket. Corridor
 scores are checked before cache lookup because observations can change without a
 city-score update. Incompatible or unavailable corridor responses retain the
@@ -203,15 +232,16 @@ The three percentage fields are intentionally different:
 - `route_signal_percent` is the aggregate connectivity score for the selected route,
   expressed as a percentage. During Phase 1 it is equivalent to
   `avg_connectivity * 100`.
-- `real_data_coverage_percent` is the percentage of scored route edges whose value is
-  backed by a real tower observation. The provider may be `unknown` when the data is
-  known to be observed but its provider cannot be established. An ML-filled edge is
-  not real coverage.
+- `real_data_coverage_percent` is the percentage of scored route edges with an
+  established `opencellid` or `trai` source. Legacy tower records with no source
+  evidence remain `unknown` and contribute zero to this percentage, even when used
+  to calculate a numerical estimate. ML-filled edges also contribute zero.
 - `good_signal_percent` is the percentage of scored route edges whose connectivity
   score is at least `0.6`, regardless of provenance.
 
-`signal_source` is the aggregate provenance. It is `hybrid` whenever the route mixes
-real and estimated edges. Each `signal_segments` entry carries its own
+`signal_source` is the aggregate provenance. It is `hybrid` when the route mixes
+known real and ML/synthetic edges, and `unknown` if any selected edge has unknown
+provenance. Each `signal_segments` entry carries its own
 `provenance_source`, so clients do not need to infer per-edge provenance from the
 aggregate value.
 
@@ -280,7 +310,9 @@ republishes the graph with an identity before using it. Routing stays read-only.
 Legacy or mismatched real-score files are ignored rather than relabeled as current
 coverage; an accepted persisted score file must contain graph/score identities,
 scores, and metadata together in one envelope. Separate legacy sidecars cannot
-prove compatibility. Route-cache entries from schemas before 7 are discarded.
+prove compatibility. Route-cache entries from schemas before 8 are discarded;
+schema 8 also invalidates older results that counted unknown tower sources as real
+coverage.
 
 ### Error response
 
@@ -352,11 +384,13 @@ edges; when that base value is estimated, its provenance remains `ml_synthetic`.
 data service must not assign the real-data source of a different edge to the whole
 corridor.
 
-On this endpoint, `good_signal_percent` is the share of returned real-data overrides
+On this endpoint, `good_signal_percent` is the share of returned tower-derived overrides
 whose score is at least `0.6`. The routing response recomputes its own
 `good_signal_percent` across the complete selected path after ML fallback is applied.
-`real_data_source` identifies the real provider when it is known; it may be `unknown`
-without changing the fact that entries in `scores` are real-data overrides.
+`real_data_source` identifies the real provider when it is known. Entries in `scores`
+may also be estimates from local records with `unknown` provenance; those entries
+are not counted as real-data coverage. Numeric signal quality is not evidence of
+provider identity or calibrated coverage.
 
 `GET /api/corridor-towers` returns tower records, `source`, `tower_count`/`count`,
 `real_data_coverage_percent`, and the queried bounding box. Empty results are valid and
@@ -381,6 +415,60 @@ for every returned score; it is the authoritative city-wide per-edge provenance 
 when a later corridor query has no override for that edge. `/cache-status` reports
 fresh tile ingestion progress separately from fresh real-data coverage; cache
 completeness is not a signal-quality metric.
+
+For local validation, `LOCAL_DATA_ONLY=1` disables graph downloads, external tower
+requests, credential/dotenv loading, and the background ingestion worker. Existing
+local CSV data is queried on demand and retains `LOCAL_TOWER_PROVENANCE` (default
+`unknown`); missing local data cannot trigger an external fallback. A missing graph
+uses the existing bounded loading/retry behavior. Configure all writable graph,
+tower, score, and route-cache paths to a separate working directory. This flag does
+not disable the local prediction-service call or authorize prediction model training.
+
+## Prediction and product request handling
+
+The direct service `/predict` accepts `city`, up to 250,000
+`segments`, optional `graph_revision`, and optional integer `hour_of_day` (0–23).
+Each segment has a unique nonempty `id`, finite latitude/longitude within geographic
+bounds, nonnegative finite length in metres, and a highway class. Default hour is
+India Standard Time, independent of host timezone. Its seven model inputs are
+highway code, latitude, longitude, hour, night flag, city-centre terrain proxy, and
+length. An empty batch is valid when the model is ready.
+
+Results include scores clipped to [0,1], the caller's graph revision,
+`data_source`, and nullable `confidence`. A legacy bare model reports unknown
+training source and null confidence; historical assumed confidence is not exposed
+as a calibrated metric. Predictions always remain estimated edge provenance.
+Readiness requires successful artifact loading, seven features, and a finite probe.
+Missing/corrupt/incompatible models keep liveness available and return readiness
+503 and inference 503. Invalid inputs/duplicate IDs return 422; malformed or failed
+inference returns a safe 503 detail. Requests do not trigger repeated model loads.
+Restore a compatible artifact and restart for recovery.
+
+CPU is the default (`PREDICTION_DEVICE=cpu`, `MODEL_THREADS=2`), with one shared model
+and serialized inference. Automatic training is disabled by default. The existing
+training path requires the separate, explicit `ALLOW_MODEL_TRAINING=1`; it is not
+part of local product startup. Available tower files never cause serving to
+retrain/relabel a model. The default manifest uses pinned `xgboost-cpu==3.2.0`,
+without CUDA/NCCL dependencies. Optional GPU packaging remains separate.
+
+`GET /api/geocode?q=...` is an explicit, bounded Bengaluru place search through the
+data service. Query length is 3–200 characters; coordinates return in `[lat, lon]`
+order. Nominatim calls are serialized and spaced at least one second apart, with
+a 10-second provider timeout and a 128-entry, 30-minute cache. Missing places return
+404; provider/parse failures return a safe 503 suggesting map/coordinate entry.
+There are no automatic reverse requests, bulk searches, or geocoding jobs. The
+local-only flag disables graph/tower ingestion, while explicit user place search
+and browser basemap requests may still access their public providers.
+
+The frontend bounds each route HTTP/body read to 90 seconds and warming retries
+to ten minutes, respecting `Retry-After` without shortening it. Input/vehicle
+changes abort pending transport and invalidate older response generations. Edited
+endpoint text immediately clears previous routes. Explicit retry starts a new
+bounded user attempt. Other API reads have 30-second deadlines; prediction readiness
+uses five seconds and place search uses fifteen seconds, allowing the provider's
+ten-second failure response to reach the user. Malformed successful route geometry/ETA/connectivity is rejected
+instead of displayed as an empty zero-valued route. Prediction availability is
+shown separately; retained/neutral estimates are never proof that inference ran.
 
 ## Gateway health routes
 
