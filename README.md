@@ -168,7 +168,7 @@ The public deployment archive contains the tagged source, production Compose
 files, and lock files. It intentionally does not contain the graph, tower CSV,
 or model. Those validated inputs are in the private transfer archive
 `zero-latency-f-0.1.0-private-runtime.tar.gz` (SHA-256
-`1d476e87c08af8786857f53598b24b5dd7be19ac894bc58d518309a8ff96348b`). Keep it
+`86816633c13e6a4e204dee3e3ae1e7e7b3cc0115f64041f16bf8094248dad6ea`). Keep it
 private and transfer it manually for Phase 2F-B. Verify both the archive hash
 and its internal `SHA256SUMS` before use. See [`DEPLOYMENT.md`](DEPLOYMENT.md),
 [`deployment-artifacts-manifest.json`](deployment-artifacts-manifest.json), and
