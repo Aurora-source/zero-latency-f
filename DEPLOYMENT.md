@@ -13,7 +13,7 @@ runtime graph, tower, and model data.
 
 **The separate private file for manual transfer to the Ubuntu server is
 `zero-latency-f-0.1.0-private-runtime.tar.gz`, SHA-256
-`86816633c13e6a4e204dee3e3ae1e7e7b3cc0115f64041f16bf8094248dad6ea`. It is
+`1d476e87c08af8786857f53598b24b5dd7be19ac894bc58d518309a8ff96348b`. It is
 not attached to the public GitHub Release.** Keep it private. Check the archive
 hash against the release manifest, extract it outside any public/web directory,
 then run `sha256sum -c SHA256SUMS` inside the extracted bundle.
@@ -48,6 +48,16 @@ checksums before use. The model is a pickle: only use this trusted, hash-matched
 private transfer. Keep source artifacts read-only; Compose creates separate
 named volumes for mutable graph publication, generated data/score state, route
 cache, and prediction runtime.
+
+The backend containers run as UID/GID 10001 and mount the source read-only. On
+the server, grant that group read/traverse access without making the directory
+world-readable:
+
+```bash
+sudo chown -R root:10001 /srv/zero-latency-f/artifacts
+sudo find /srv/zero-latency-f/artifacts -type d -exec chmod 750 {} +
+sudo find /srv/zero-latency-f/artifacts -type f -exec chmod 640 {} +
+```
 
 ## Configure and start
 
