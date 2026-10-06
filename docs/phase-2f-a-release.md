@@ -35,7 +35,8 @@ staging. No broad normalization or reset was run. The accumulated C1–E overlay
 contained 64 tracked functional, test, and documentation files (8,839
 insertions, 665 deletions) against cb7b454. Its contents match the changed-file
 inventories in the C1, D, and E reports; no unexplained or generated artifact
-was found. The three release-preparation commits are:
+was found. The three accumulated C1–E release-preparation commits present at
+the start of this final release audit were:
 
 - 612931d — production-ready C1–E project changes, release README, deployment
   guide, and public runtime-artifact manifest.
@@ -88,10 +89,10 @@ from the final tagged source tree. Observed Docker image sizes:
 
 | Image | Size |
 | --- | ---: |
-| zero-latency-data | 222,591,695 bytes (212.3 MiB) |
-| zero-latency-routing | 172,063,518 bytes (164.0 MiB) |
-| zero-latency-prediction | 169,488,224 bytes (161.5 MiB) |
-| zero-latency-gateway | 29,637,537 bytes (28.3 MiB) |
+| zero-latency-data | 222,591,691 bytes (212.3 MiB) |
+| zero-latency-routing | 172,063,514 bytes (164.0 MiB) |
+| zero-latency-prediction | 169,488,220 bytes (161.5 MiB) |
+| zero-latency-gateway | 29,637,533 bytes (28.3 MiB) |
 
 The release uses version and exact Git-SHA tags. The public release includes an
 optional gzip-compressed Docker image archive when it remains under GitHub's
