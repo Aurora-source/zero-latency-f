@@ -5,13 +5,17 @@ import gc
 import os
 import subprocess
 import time
+from datetime import datetime
+from threading import Lock
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import joblib
 import numpy as np
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import xgboost as xgb
 
@@ -35,6 +39,13 @@ app = FastAPI(title="Connectivity Prediction Service", version="0.2.0")
 DEFAULT_MODEL_DIR = Path(__file__).resolve().parent / "models"
 MODEL_DIR = Path(os.getenv("MODEL_DIR", str(DEFAULT_MODEL_DIR)))
 MODEL_PATH = MODEL_DIR / "connectivity_model.pkl"
+ALLOW_MODEL_TRAINING = os.getenv("ALLOW_MODEL_TRAINING", "0") == "1"
+PREDICTION_DEVICE = os.getenv("PREDICTION_DEVICE", "cpu").strip().lower()
+MODEL_THREADS = max(1, int(os.getenv("MODEL_THREADS", "2")))
+MAX_PREDICT_SEGMENTS = 250_000
+MODEL_LOCK = Lock()
+INFERENCE_LOCK = Lock()
+MODEL_ERROR: str | None = None
 SYNTHETIC_SAMPLE_COUNT = 500_000
 TOWER_DATA_DIR = Path(__file__).resolve().parents[1] / "data-service" / "data" / "towers"
 
@@ -62,8 +73,8 @@ USE_GPU = False
 USE_CUPY = False
 GPU_NAME = "CPU"
 MAX_RAM_MB = int(os.getenv("MAX_RAM_MB", "1024"))
-MODEL_SOURCE = "synthetic"
-MODEL_CONFIDENCE = 0.65
+MODEL_SOURCE = "unknown"
+MODEL_CONFIDENCE: float | None = None
 TOWER_CHUNK_SIZE = 4096
 GPU_BATCH_SIZE = int(os.getenv("GPU_BATCH_SIZE", "50000"))
 TOWER_WEIGHT_ENCODING = {
@@ -88,22 +99,25 @@ class TowerDataset:
 
 
 class SegmentPayload(BaseModel):
-    id: str
+    id: str = Field(min_length=1)
     highway: str = "unknown"
-    lat: float
-    lon: float
-    length: float = Field(default=1.0, ge=0.0)
+    lat: float = Field(ge=-90, le=90, allow_inf_nan=False)
+    lon: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    length: float = Field(default=1.0, ge=0.0, allow_inf_nan=False)
 
 
 class PredictRequest(BaseModel):
     city: str | None = None
-    segments: list[SegmentPayload]
+    segments: list[SegmentPayload] = Field(max_length=MAX_PREDICT_SEGMENTS)
+    graph_revision: str | None = Field(default=None, min_length=1)
+    hour_of_day: int | None = Field(default=None, ge=0, le=23)
 
 
 class PredictResponse(BaseModel):
     scores: dict[str, float]
     data_source: str
-    confidence: float
+    confidence: float | None
+    graph_revision: str | None = None
 
 
 def detect_system_gpu() -> None:
@@ -133,11 +147,11 @@ def configure_gpu_runtime() -> None:
     global USE_CUPY
     global GPU_NAME
 
-    if torch is None:
+    if PREDICTION_DEVICE == "cpu" or torch is None:
         USE_GPU = False
         USE_CUPY = False
         GPU_NAME = "CPU"
-        print("[prediction] torch not installed, using CPU")
+        print("[prediction] using CPU inference")
         return
 
     try:
@@ -377,7 +391,8 @@ def build_feature_matrix(
     city: str | None,
     hour_of_day: int | None = None,
 ) -> np.ndarray:
-    hour = hour_of_day if hour_of_day is not None else time.localtime().tm_hour
+    # Supported cities are in India; host timezone must not shift model inputs.
+    hour = hour_of_day if hour_of_day is not None else datetime.now(ZoneInfo("Asia/Kolkata")).hour
     night_flag = is_night_hour(hour)
     rows: list[list[float]] = []
 
@@ -537,7 +552,7 @@ def save_model_bundle(model: Any, family: str) -> None:
     joblib.dump(payload, MODEL_PATH)
 
 
-def load_saved_model(desired_source: str) -> tuple[Any, str] | None:
+def load_saved_model(desired_source: str | None = None) -> tuple[Any, str] | None:
     global MODEL_SOURCE
     global MODEL_CONFIDENCE
 
@@ -546,23 +561,24 @@ def load_saved_model(desired_source: str) -> tuple[Any, str] | None:
 
     loaded = joblib.load(MODEL_PATH)
     if isinstance(loaded, dict) and loaded.get("model") is not None:
-        saved_source = str(loaded.get("source") or "synthetic")
-        if saved_source != desired_source:
+        saved_source = str(loaded.get("source") or "unknown")
+        if desired_source is not None and saved_source != desired_source:
             print(
                 f"[prediction] cached model uses {saved_source}; "
                 f"retraining for {desired_source} labels"
             )
             return None
         MODEL_SOURCE = saved_source
-        MODEL_CONFIDENCE = float(loaded.get("confidence") or MODEL_CONFIDENCE)
+        # Historic bundles contain assumed confidence, not calibration evidence.
+        MODEL_CONFIDENCE = None
         family = str(loaded.get("family") or loaded["model"].__class__.__name__).lower()
         return loaded["model"], family
 
     if hasattr(loaded, "predict"):
-        if desired_source != "synthetic":
+        if desired_source is not None and desired_source != "synthetic":
             return None
-        MODEL_SOURCE = "synthetic"
-        MODEL_CONFIDENCE = 0.68
+        MODEL_SOURCE = "unknown"
+        MODEL_CONFIDENCE = None
         return loaded, loaded.__class__.__name__.lower()
 
     return None
@@ -572,6 +588,27 @@ def train_or_load_model() -> tuple[Any, str]:
     global MODEL_DEVICE
     global MODEL_SOURCE
     global MODEL_CONFIDENCE
+
+    # Serving never infers a training requirement from the available tower files.
+    # Missing/corrupt artifacts need explicit operator repair, not a costly job.
+    if not ALLOW_MODEL_TRAINING:
+        loaded = load_saved_model()
+        if loaded is None:
+            raise RuntimeError("A compatible local model is required; automatic training is disabled")
+        model, family = loaded
+        if int(getattr(model, "n_features_in_", 0)) != 7:
+            raise RuntimeError("Model feature count is incompatible with the seven-feature API")
+        if hasattr(model, "set_params"):
+            parameters = {"n_jobs": MODEL_THREADS}
+            if isinstance(model, xgb.XGBRegressor):
+                parameters["device"] = "cuda" if USE_GPU else "cpu"
+            model.set_params(**parameters)
+        MODEL_DEVICE = "gpu" if USE_GPU else "cpu"
+        # Probe before publication: a broken artifact must never become ready.
+        probe = np.asarray(model.predict(np.zeros((1, 7), dtype=np.float32)))
+        if probe.shape != (1,) or not np.all(np.isfinite(probe)):
+            raise RuntimeError("Model produced invalid predictions")
+        return model, family
 
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     tower_datasets = load_available_tower_datasets()
@@ -622,9 +659,10 @@ def get_model() -> Any:
     global MODEL_FAMILY
     global MODEL_READY_AT
 
-    if MODEL is None:
-        MODEL, MODEL_FAMILY = train_or_load_model()
-        MODEL_READY_AT = time.time()
+    with MODEL_LOCK:
+        if MODEL is None:
+            MODEL, MODEL_FAMILY = train_or_load_model()
+            MODEL_READY_AT = time.time()
     return MODEL
 
 
@@ -667,20 +705,44 @@ def predict_batch_gpu(features_list: np.ndarray) -> np.ndarray:
 
 @app.on_event("startup")
 def startup_event() -> None:
-    detect_system_gpu()
+    global MODEL_ERROR
+    if PREDICTION_DEVICE != "cpu":
+        detect_system_gpu()
     configure_gpu_runtime()
     print(f"[memory] prediction-service limit {MAX_RAM_MB}MB, current {process_memory_mb():.1f}MB")
-    get_model()
+    try:
+        get_model()
+        MODEL_ERROR = None
+    except Exception as exc:
+        MODEL_ERROR = "model_unavailable"
+        print(f"[prediction] model initialization failed: {type(exc).__name__}: {exc}")
     log_vram_usage("startup")
 
 
 @app.post("/predict", response_model=PredictResponse)
 def predict_scores(request: PredictRequest) -> PredictResponse:
+    if MODEL is None:
+        raise HTTPException(503, "Prediction model unavailable. Restore a compatible local artifact and restart prediction.")
+    if len({segment.id for segment in request.segments}) != len(request.segments):
+        raise HTTPException(422, "Segment IDs must be unique")
     if not request.segments:
-        return PredictResponse(scores={}, data_source=MODEL_SOURCE, confidence=MODEL_CONFIDENCE)
+        return PredictResponse(
+            scores={}, data_source=MODEL_SOURCE, confidence=MODEL_CONFIDENCE,
+            graph_revision=request.graph_revision,
+        )
 
-    features = build_feature_matrix(request.segments, city=request.city)
-    predictions = np.clip(predict_batch_gpu(features), 0.0, 1.0)
+    # One model instance and bounded native threads. Serializing inference also
+    # bounds feature-array duplication and protects optional model families.
+    with INFERENCE_LOCK:
+        try:
+            features = build_feature_matrix(request.segments, city=request.city, hour_of_day=request.hour_of_day)
+            raw_predictions = np.asarray(predict_batch_gpu(features))
+            if raw_predictions.shape != (len(request.segments),) or not np.all(np.isfinite(raw_predictions)):
+                raise ValueError("Invalid model output shape or values")
+            predictions = np.clip(raw_predictions, 0.0, 1.0)
+        except Exception as exc:
+            print(f"[prediction] inference failed: {type(exc).__name__}: {exc}")
+            raise HTTPException(503, "Prediction is temporarily unavailable. Try again later.") from exc
 
     return PredictResponse(
         scores={
@@ -689,11 +751,14 @@ def predict_scores(request: PredictRequest) -> PredictResponse:
         },
         data_source=MODEL_SOURCE,
         confidence=MODEL_CONFIDENCE,
+        # Bind predictions to the caller's exact segment graph identity. The data
+        # service verifies it before publishing; no shared graph is read here.
+        graph_revision=request.graph_revision,
     )
 
 
 @app.get("/health")
-def health() -> dict[str, str | float | bool]:
+def health() -> dict[str, str | float | bool | None]:
     return {
         "status": "ok",
         "model_path": str(MODEL_PATH),
@@ -703,9 +768,26 @@ def health() -> dict[str, str | float | bool]:
         "model_device": MODEL_DEVICE,
         "model_source": MODEL_SOURCE,
         "model_confidence": MODEL_CONFIDENCE,
+        "model_error": MODEL_ERROR,
         "gpu_enabled": USE_GPU,
         "gpu_name": GPU_NAME,
     }
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    model_ready = bool(MODEL is not None)
+    return JSONResponse(
+        status_code=200 if model_ready else 503,
+        content={
+            "status": "ready" if model_ready else "not_ready",
+            "service": "prediction-service",
+            "model_ready": model_ready,
+            "model_family": MODEL_FAMILY,
+            "model_device": MODEL_DEVICE,
+            "code": MODEL_ERROR,
+        },
+    )
 
 
 @app.get("/memory")

@@ -1,0 +1,56 @@
+name: Release gates
+on: [push, pull_request]
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  backend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements-test.lock
+      - run: python -m pip install --require-hashes -r requirements-test.lock
+      - run: python -m pytest -q
+        env:
+          LOCAL_DATA_ONLY: '0'
+          ENV_FILE_PATH: /dev/null
+          OPENCELLID_KEYS: ''
+          OPENCELLID_TOKEN: ''
+          ALLOW_MODEL_TRAINING: '0'
+          PREDICTION_DEVICE: cpu
+      - run: git diff --check
+  frontend:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: services/visualization
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.2'
+          cache: npm
+          cache-dependency-path: services/visualization/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test -- --run
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm run build
+  containers:
+    runs-on: ubuntu-24.04
+    strategy:
+      max-parallel: 2
+      matrix:
+        service: [data-service, routing-engine, prediction-service, gateway]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate topology
+        run: ARTIFACT_DIR="$PWD/.cache/ci-config-only" docker compose --env-file /dev/null config --quiet
+      - name: Build CPU release image (no private artifacts)
+        run: ARTIFACT_DIR="$PWD/.cache/ci-config-only" docker compose --env-file /dev/null build "${{ matrix.service }}"

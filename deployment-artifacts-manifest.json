@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "project": "zero-latency-f",
+  "release_version": "0.1.0",
+  "artifacts": [
+    {
+      "logical_name": "bengaluru_routing_graph",
+      "expected_filename": "bangalore.graphml",
+      "sha256": "ca0c638be582c38a3aeacfc7f6afca7b183f9cec30b42ba6ea08c2abd3fe8ca9",
+      "byte_size": 130110773,
+      "format_schema": "GraphML/XML directed simplified graph; EPSG:4326; 71,618 nodes; 227,047 edges; OSMnx 2.0.2; graph revision 4e762aa11553433fadcfe493666fc841",
+      "target_server_path": "/srv/zero-latency-f/artifacts/bangalore.graphml",
+      "container_mount": "/artifacts/bangalore.graphml",
+      "public_private_status": "private runtime bundle only; excluded from public release assets",
+      "provenance_status": "GraphML metadata gives OSMnx 2.0.2 and creation date 2026-04-18; exact upstream query, source snapshot, and retrieval receipt are unavailable.",
+      "redistribution_status": "ODbL attribution and redistribution review is incomplete; not published publicly.",
+      "regeneration": "Potentially regenerable from OSM using OSMnx, but the original query/coverage is not recorded; regeneration requires route-equivalence review.",
+      "consumer": "Data service seeds the shared graph publication; routing engine reads the published graph read-only."
+    },
+    {
+      "logical_name": "tower_connectivity_input",
+      "expected_filename": "bangalore_towers.csv",
+      "sha256": "9a4647602dfa52bad14c98cb68021e06901399ace26f2c651f78ea44e3a218bc",
+      "byte_size": 6293112,
+      "format_schema": "UTF-8 CSV with lat, lon, mcc, mnc, lac, cellid, radio, range; 122,409 rows; observed coordinate bounds 12.75..13.138962 N, 77.35..77.85 E",
+      "target_server_path": "/srv/zero-latency-f/artifacts/bangalore_towers.csv",
+      "container_mount": "/artifacts/bangalore_towers.csv",
+      "public_private_status": "private runtime bundle only; excluded from public release assets",
+      "provenance_status": "Provider, acquisition method, observation dates, and source license are unknown.",
+      "redistribution_status": "Unknown; not published publicly.",
+      "regeneration": "No compatible, reproducible acquisition process is established by the repository evidence.",
+      "consumer": "Data service local tower ingestion and score generation."
+    },
+    {
+      "logical_name": "connectivity_prediction_model",
+      "expected_filename": "connectivity_model.pkl",
+      "sha256": "b701d3988b7b4dcba4360baccc8db84d9ead8d3953067eb505af2c4d0878ef7c",
+      "byte_size": 672086,
+      "format_schema": "Python pickle containing XGBRegressor; seven prediction-service features; XGBoost 3.2.0; 140 boosting rounds",
+      "target_server_path": "/srv/zero-latency-f/artifacts/connectivity_model.pkl",
+      "container_mount": "/artifacts/connectivity_model.pkl",
+      "public_private_status": "private runtime bundle only; excluded from public release assets",
+      "provenance_status": "Training dataset/date, evaluation metrics, calibration, confidence, original source, and model license are unknown.",
+      "redistribution_status": "Unknown; trusted private transfer only; not published publicly.",
+      "regeneration": "No legitimate training dataset or reproducible model-production procedure is established; do not substitute or retrain.",
+      "consumer": "Prediction service loads the model read-only and provides estimated edge scores."
+    }
+  ],
+  "generated_runtime_state": [
+    {
+      "logical_name": "graph_publication",
+      "path": "/runtime/graphs/bangalore.graphml",
+      "status": "generated from immutable graph input by the data service, then shared read-only with routing",
+      "persistence": "Compose named graph-publication volume"
+    },
+    {
+      "logical_name": "tower_database_scores_and_caches",
+      "path": "/runtime/towers, /runtime/scores, and bounded cache paths",
+      "status": "derived and safely refreshable from the tower source and running services",
+      "persistence": "Compose named data-runtime volume"
+    },
+    {
+      "logical_name": "route_cache",
+      "path": "/runtime/route_cache.json",
+      "status": "derived cache keyed by compatible graph and score revisions; safe to invalidate/rebuild",
+      "persistence": "Compose named routing-runtime volume"
+    },
+    {
+      "logical_name": "visual_basemap_tiles",
+      "status": "not bundled; fetched from the frontend's configured internet tile provider",
+      "redistribution_status": "No tile data is redistributed by this release."
+    }
+  ]
+}

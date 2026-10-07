@@ -8,6 +8,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export default defineConfig({
+  // Browser configuration is public; credentials belong only in the data service.
+  envDir: false,
   plugins: [
     react(),
     tailwindcss(),
@@ -30,6 +32,16 @@ export default defineConfig({
     ],
 
     proxy: {
+      "/api/geocode": {
+        target: "http://127.0.0.1:8001",
+        changeOrigin: true,
+        rewrite: (path) => path.replace("/api", ""),
+      },
+      "/api/ready/prediction": {
+        target: "http://127.0.0.1:8003",
+        changeOrigin: true,
+        rewrite: (path) => path.replace("/api/ready/prediction", "/ready"),
+      },
       "/api/cities": {
         target: "http://localhost:8001",
         changeOrigin: true,
@@ -55,17 +67,17 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (path) => path.replace("/api", ""),
       },
+      "/api/cache-status": {
+        target: "http://localhost:8001",
+        changeOrigin: true,
+        rewrite: (path) => path.replace("/api", ""),
+      },
       "/api/tiles": {
         target: "http://localhost:8001",
         changeOrigin: true,
         rewrite: (path) => path.replace("/api", ""),
       },
       "/api/scores": {
-        target: "http://localhost:8001",
-        changeOrigin: true,
-        rewrite: (path) => path.replace("/api", ""),
-      },
-      "/api/cache-status": {
         target: "http://localhost:8001",
         changeOrigin: true,
         rewrite: (path) => path.replace("/api", ""),

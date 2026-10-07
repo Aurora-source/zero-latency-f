@@ -3,19 +3,24 @@ from __future__ import annotations
 import ast
 import asyncio
 import gc
+import hashlib
 import json
 import math
 import os
-import platform
+import re
 import subprocess
+import tempfile
 import time
 from collections import Counter, OrderedDict, defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event, Lock, Thread
 from typing import Any, Literal
 from urllib import error, request
+from uuid import uuid4
 
 import networkx as nx
 import numpy as np
@@ -41,6 +46,10 @@ CACHE_TTL_SECONDS = 24 * 60 * 60
 SCORE_REFRESH_SECONDS = 60
 ROUTE_CACHE_TTL_SECONDS = 10 * 60
 ROUTE_CACHE_MAX_ENTRIES = 200
+ROUTE_CACHE_SCHEMA_VERSION = 8
+GRAPH_LOAD_MAX_ATTEMPTS = 3
+GRAPH_LOAD_RETRY_SECONDS = 5
+GRAPH_PUBLICATION_WAIT_SECONDS = 10 * 60
 DEFAULT_SUPPORTED_CITIES = "bangalore"
 DEFAULT_DEFAULT_CITY = "bangalore"
 DEFAULT_DATA_SERVICE_URL = "http://data-service:8001"
@@ -54,7 +63,7 @@ CITY_PLACE_QUERIES: dict[str, str] = {
 }
 CPU_CORES = max(1, os.cpu_count() or 1)
 THREAD_POOL = ThreadPoolExecutor(
-    max_workers=CPU_CORES,
+    max_workers=max(1, int(os.getenv("ROUTING_THREADS", str(CPU_CORES)))),
     thread_name_prefix="routing_worker",
 )
 CITY_LOCKS = defaultdict(Lock)
@@ -68,12 +77,52 @@ GPU_NAME = "CPU"
 ACTIVE_CITY: str | None = None
 MAX_RAM_MB = int(os.getenv("MAX_RAM_MB", "2048"))
 ROUTE_CACHE_LOCK = Lock()
+ROUTE_CACHE_WRITE_LOCK = Lock()
 ROUTE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+ROUTE_FLIGHTS_LOCK = Lock()
+ROUTE_FLIGHTS: dict[tuple[Any, ...], Future] = {}
 
 ox.settings.use_cache = True
 ox.settings.log_console = False
 
 app = FastAPI(title="Connectivity-Aware Routing Engine", version="0.4.0")
+
+PROVENANCE_OPENCELLID = "opencellid"
+PROVENANCE_TRAI = "trai"
+PROVENANCE_ML_SYNTHETIC = "ml_synthetic"
+PROVENANCE_HYBRID = "hybrid"
+PROVENANCE_UNKNOWN = "unknown"
+
+
+def canonical_provenance(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    aliases = {
+        "opencellid": PROVENANCE_OPENCELLID,
+        "open_cell_id": PROVENANCE_OPENCELLID,
+        "trai": PROVENANCE_TRAI,
+        "trai_india": PROVENANCE_TRAI,
+        "ml": PROVENANCE_ML_SYNTHETIC,
+        "ml_estimate": PROVENANCE_ML_SYNTHETIC,
+        "ml_synthetic": PROVENANCE_ML_SYNTHETIC,
+        "synthetic": PROVENANCE_ML_SYNTHETIC,
+        "hybrid": PROVENANCE_HYBRID,
+        "mixed": PROVENANCE_HYBRID,
+        "mixed_source": PROVENANCE_HYBRID,
+        "opencellid+ml": PROVENANCE_HYBRID,
+        "unknown": PROVENANCE_UNKNOWN,
+    }
+    return aliases.get(normalized, PROVENANCE_UNKNOWN)
+
+
+def first_payload_percentage(payload: dict[str, Any], *names: str) -> float:
+    for name in names:
+        if name not in payload or payload[name] is None:
+            continue
+        try:
+            return max(0.0, min(100.0, float(payload[name])))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 app.add_middleware(
     CORSMiddleware,
@@ -109,6 +158,8 @@ class PreparedVehicleGraph:
     below_tolerance_mask: Any
     stable_mask: Any
     flood_labels: dict[int, str] = field(default_factory=dict)
+    risk_time_bucket: str = "day"
+    risk_hour: int = 12
     computed_at: float = 0.0
     source_scores_updated_at: float = 0.0
 
@@ -125,14 +176,44 @@ class GraphState:
     vehicle_graphs: dict[str, PreparedVehicleGraph] = field(default_factory=dict)
     lock: Lock = field(default_factory=Lock)
     score_refreshing: bool = False
+    snapshot_id: str = field(default_factory=lambda: uuid4().hex)
+    graph_revision: str = ""
+    score_revision: str = ""
 
 
-MODE_WEIGHTS: dict[str, dict[str, float]] = {
-    "fastest": {"time": 1.0, "coverage": 0.0},
-    "balanced": {"time": 0.55, "coverage": 0.9},
-    "connected": {"time": 0.05, "coverage": 2.5},
+@dataclass(frozen=True)
+class RouteSnapshot:
+    """Published graph/arrays are read-only; writers replace them together."""
+
+    base_graph: Any
+    node_index: dict[str, Any] | None
+    vehicle_graphs: dict[str, PreparedVehicleGraph]
+    scores_updated_at: float
+    snapshot_id: str
+    graph_revision: str = ""
+    score_revision: str = ""
+
+
+class GraphNotPublishedError(FileNotFoundError):
+    """Data service has not yet atomically published the shared city graph."""
+
+
+class RevisionCompatibilityError(OSError):
+    """Retry a graph/score mismatch within the existing bounded load budget."""
+
+
+def require_revision(payload: dict[str, Any], name: str) -> str:
+    revision = payload.get(name)
+    if not isinstance(revision, str) or not revision.strip():
+        raise RevisionCompatibilityError(f"Missing or invalid {name}")
+    return revision
+
+
+STRATEGY_FACTORS: dict[str, dict[str, float]] = {
+    "fastest": {"speed": 1.0, "connectivity": 0.0, "risk": 0.0, "risk_scale": 0.0},
+    "balanced": {"speed": 0.7, "connectivity": 0.9, "risk": 0.6, "risk_scale": 0.5},
+    "connected": {"speed": 0.45, "connectivity": 1.25, "risk": 1.0, "risk_scale": 1.0},
 }
-CONNECTED_COVERAGE_BONUS = 1.0
 VEHICLE_PROFILES: dict[str, dict[str, Any]] = {
     "scooter": {
         "speed": 0.3,
@@ -180,6 +261,10 @@ FLOOD_ZONES: dict[str, list[dict[str, float | str]]] = {
     ],
 }
 RISK_RADIUS_METERS = 500.0
+CITY_UTC_OFFSETS_MINUTES = {
+    "bangalore": 5 * 60 + 30,
+    "chennai": 5 * 60 + 30,
+}
 STRATEGY_ORDER: list[str] = ["fastest", "balanced", "connected"]
 WEIGHT_ATTR_BY_MODE = {
     "fastest": "fastest_cost",
@@ -196,6 +281,20 @@ ROAD_SPEEDS_KPH = {
     "construction": 15.0,
     "unknown": 25.0,
 }
+# Planning speeds, not statutory limits or measured Bengaluru traffic speeds.
+VEHICLE_SPEED_CAPS_KPH = {"bike": 18.0, "scooter": 45.0, "car": 120.0, "truck": 80.0}
+VEHICLE_ACCESS_KEYS = {
+    "bike": ("bicycle", "vehicle", "access"),
+    "scooter": ("motorcycle", "motor_vehicle", "vehicle", "access"),
+    "car": ("motorcar", "motor_vehicle", "vehicle", "access"),
+    "truck": ("hgv", "motor_vehicle", "vehicle", "access"),
+}
+PUBLIC_ACCESS_VALUES = {"yes", "permissive", "designated", "official", "discouraged"}
+DIMENSION_RESTRICTIONS = ("maxweight", "maxaxleload", "maxheight", "maxwidth", "maxlength")
+NO_ROUTE_DETAIL = (
+    "No route found. The selected points may be in disconnected areas. "
+    "Try points closer to main roads."
+)
 TEST_ROUTE_COORDS: dict[str, tuple[tuple[float, float], tuple[float, float]]] = {
     "bangalore": ((12.9716, 77.5946), (12.9948, 77.6699)),
     "chennai": ((13.0827, 80.2707), (13.0569, 80.2425)),
@@ -353,15 +452,37 @@ def load_route_cache() -> None:
     with ROUTE_CACHE_LOCK:
         ROUTE_CACHE.clear()
         for cache_key, entry in payload.items():
-            if isinstance(entry, dict):
+            if isinstance(entry, dict) and entry.get("schema_version") == ROUTE_CACHE_SCHEMA_VERSION:
                 ROUTE_CACHE[str(cache_key)] = entry
 
 
 def persist_route_cache() -> None:
-    ROUTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with ROUTE_CACHE_LOCK:
-        payload = dict(ROUTE_CACHE)
-    ROUTE_CACHE_PATH.write_text(json.dumps(payload), encoding="utf-8")
+    # The single routing process owns this file. Serialize snapshot + publication,
+    # so a slow earlier writer cannot replace a newer snapshot on disk.
+    with ROUTE_CACHE_WRITE_LOCK:
+        temporary_path = None
+        try:
+            ROUTE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with ROUTE_CACHE_LOCK:
+                payload = dict(ROUTE_CACHE)
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=ROUTE_CACHE_PATH.parent,
+                prefix=f".{ROUTE_CACHE_PATH.name}.", suffix=".tmp", delete=False,
+            ) as stream:
+                temporary_path = Path(stream.name)
+                json.dump(payload, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_path, ROUTE_CACHE_PATH)
+        except (OSError, TypeError, ValueError) as exc:
+            # Persistence is an optimization; a successful route still succeeds.
+            print(f"[cache] failed to persist route cache: {exc}")
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    print(f"[cache] failed to remove temporary route cache: {exc}")
 
 
 def route_cache_key(
@@ -370,6 +491,9 @@ def route_cache_key(
     destination: tuple[float, float],
     mode: str,
     vehicle: str,
+    risk_time_bucket: str | None = None,
+    snapshot_id: str = "",
+    corridor_score_revision: str = "",
 ) -> str:
     return json.dumps(
         {
@@ -378,6 +502,9 @@ def route_cache_key(
             "destination": [round(destination[0], 5), round(destination[1], 5)],
             "mode": mode,
             "vehicle": vehicle,
+            "risk_time_bucket": risk_time_bucket or city_risk_time_bucket(city),
+            "snapshot_id": snapshot_id,
+            "corridor_score_revision": corridor_score_revision,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -391,23 +518,47 @@ def get_cached_route(
     mode: str,
     vehicle: str,
     score_version: float,
+    risk_time_bucket: str | None = None,
+    snapshot_id: str = "",
+    corridor_score_revision: str = "",
 ) -> dict[str, Any] | None:
-    cache_key = route_cache_key(city, origin, destination, mode, vehicle)
+    cache_key = route_cache_key(
+        city,
+        origin,
+        destination,
+        mode,
+        vehicle,
+        risk_time_bucket,
+        snapshot_id,
+        corridor_score_revision,
+    )
     now = time.time()
     with ROUTE_CACHE_LOCK:
         entry = ROUTE_CACHE.get(cache_key)
         if entry is None:
             return None
-        stored_at = float(entry.get("stored_at") or 0.0)
-        cached_score_version = float(entry.get("score_version") or 0.0)
-        if now - stored_at > ROUTE_CACHE_TTL_SECONDS or cached_score_version < score_version:
+        try:
+            stored_at = float(entry.get("stored_at") or 0.0)
+            cached_score_version = float(entry.get("score_version") or 0.0)
+            schema_version = int(entry.get("schema_version") or 0)
+        except (TypeError, ValueError, OverflowError):
+            ROUTE_CACHE.pop(cache_key, None)
+            return None
+        if (
+            schema_version != ROUTE_CACHE_SCHEMA_VERSION
+            or not math.isfinite(stored_at)
+            or not math.isfinite(cached_score_version)
+            or stored_at > now
+            or now - stored_at > ROUTE_CACHE_TTL_SECONDS
+            or cached_score_version != score_version
+        ):
             ROUTE_CACHE.pop(cache_key, None)
             return None
         ROUTE_CACHE.move_to_end(cache_key)
         response = entry.get("response")
         if isinstance(response, dict):
             print(f"[cache] route hit for {city}/{mode}/{vehicle}")
-            return response
+            return deepcopy(response)
     return None
 
 
@@ -419,13 +570,26 @@ def store_cached_route(
     vehicle: str,
     score_version: float,
     response: dict[str, Any],
+    risk_time_bucket: str | None = None,
+    snapshot_id: str = "",
+    corridor_score_revision: str = "",
 ) -> None:
-    cache_key = route_cache_key(city, origin, destination, mode, vehicle)
+    cache_key = route_cache_key(
+        city,
+        origin,
+        destination,
+        mode,
+        vehicle,
+        risk_time_bucket,
+        snapshot_id,
+        corridor_score_revision,
+    )
     with ROUTE_CACHE_LOCK:
         ROUTE_CACHE[cache_key] = {
+            "schema_version": ROUTE_CACHE_SCHEMA_VERSION,
             "stored_at": time.time(),
             "score_version": score_version,
-            "response": response,
+            "response": deepcopy(response),
         }
         ROUTE_CACHE.move_to_end(cache_key)
         while len(ROUTE_CACHE) > ROUTE_CACHE_MAX_ENTRIES:
@@ -471,75 +635,6 @@ def weight_array_for_mode(prepared: PreparedVehicleGraph, mode: str) -> Any:
     if mode == "connected":
         return prepared.connected_cost
     return prepared.balanced_cost
-
-
-def weighted_coverage_score(mode: str, coverage_score: float) -> float:
-    normalized_score = max(0.0, min(1.0, float(coverage_score)))
-    if mode == "connected":
-        return normalized_score * CONNECTED_COVERAGE_BONUS
-    return normalized_score
-
-
-def route_mode_cost(mode: str, time_cost: float, coverage_score: float) -> float:
-    weights = MODE_WEIGHTS[mode]
-    return max(
-        (float(weights["time"]) * float(time_cost))
-        - (float(weights["coverage"]) * float(coverage_score)),
-        0.001,
-    )
-
-
-def warn_if_route_signal_gap_is_small(
-    city: str,
-    origin: tuple[float, float],
-    destination: tuple[float, float],
-    vehicle: str,
-    mode: str,
-    score_version: float,
-    route_signal_percent: float,
-) -> None:
-    if mode not in STRATEGY_ORDER:
-        return
-
-    route_payloads: dict[str, dict[str, Any]] = {mode: {"route_signal_percent": route_signal_percent}}
-    for candidate_mode in STRATEGY_ORDER:
-        if candidate_mode == mode:
-            continue
-        cache_key = route_cache_key(city, origin, destination, candidate_mode, vehicle)
-        with ROUTE_CACHE_LOCK:
-            cache_entry = ROUTE_CACHE.get(cache_key)
-        if cache_entry is None:
-            return
-        cached_score_version = float(cache_entry.get("score_version") or 0.0)
-        cached_response = cache_entry.get("response")
-        if cached_score_version < score_version or not isinstance(cached_response, dict):
-            return
-        route_payloads[candidate_mode] = cached_response
-
-    fastest_signal = float(
-        route_payloads["fastest"].get(
-            "route_signal_percent",
-            float(route_payloads["fastest"].get("avg_connectivity", 0.0)) * 100.0,
-        )
-    )
-    balanced_signal = float(
-        route_payloads["balanced"].get(
-            "route_signal_percent",
-            float(route_payloads["balanced"].get("avg_connectivity", 0.0)) * 100.0,
-        )
-    )
-    connected_signal = float(
-        route_payloads["connected"].get(
-            "route_signal_percent",
-            float(route_payloads["connected"].get("avg_connectivity", 0.0)) * 100.0,
-        )
-    )
-    print(
-        f"[divergence] fastest={fastest_signal:.1f}% "
-        f"balanced={balanced_signal:.1f}% connected={connected_signal:.1f}%"
-    )
-    if connected_signal - fastest_signal < 15.0:
-        print("[warn] routes still converging — signal data may be sparse for this origin/destination pair")
 
 
 def log_memory_limit(service_name: str) -> None:
@@ -733,30 +828,12 @@ def graph_cache_path(city: str) -> Path:
 
 
 def ensure_connected_graph(graph):
-    print("[graph] checking connectivity...")
-    total_nodes = graph.number_of_nodes()
-    total_edges = graph.number_of_edges()
-    print(f"[graph] nodes: {total_nodes}, edges: {total_edges}")
-    if total_nodes == 0:
+    """Validate topology without removing one-way branches or small components."""
+    if graph.number_of_nodes() == 0:
         raise RuntimeError("Loaded graph has no nodes")
-
-    if graph.is_directed():
-        largest_component = max(nx.strongly_connected_components(graph), key=len)
-        component_name = "SCC"
-    else:
-        largest_component = max(nx.connected_components(graph), key=len)
-        component_name = "CC"
-
-    connected_graph = graph.subgraph(largest_component).copy()
-    kept_ratio = (len(largest_component) / max(total_nodes, 1)) * 100.0
-    print(
-        f"[graph] largest {component_name}: {connected_graph.number_of_nodes()} nodes "
-        f"({kept_ratio:.1f}% of graph)"
-    )
-    removed_nodes = total_nodes - connected_graph.number_of_nodes()
-    if removed_nodes > 0:
-        print(f"[graph] removed {removed_nodes} disconnected nodes")
-    return connected_graph
+    if not graph.is_directed():
+        raise ValueError("Routing requires a directed graph with represented travel directions")
+    return graph
 
 
 def simplify_city_graph(city: str, graph):
@@ -787,78 +864,280 @@ def simplify_city_graph(city: str, graph):
 
 
 def load_or_fetch_graph(city: str):
+    """Read the data-service-owned graph; never fetch or rewrite shared GraphML."""
     city_slug = normalize_city(city)
     cache_path = graph_cache_path(city_slug)
-    GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    if cache_path.exists():
-        print("[graph] Loading Bangalore graph (cached: yes)")
-        graph = ensure_connected_graph(ox.load_graphml(cache_path))
-        ox.save_graphml(graph, cache_path)
-        return graph
-
-    print("[graph] Loading Bangalore graph (cached: no)")
-    graph = ox.graph_from_place(
-        place_query(city_slug),
-        network_type="drive",
-        simplify=False,
-        retain_all=False,
-        truncate_by_edge=True,
-    )
-    graph = simplify_city_graph(city_slug, graph)
-    ox.save_graphml(graph, cache_path)
-    print(f"[graph] Saved Bangalore graph cache to {cache_path}")
+    try:
+        before = cache_path.stat()
+    except FileNotFoundError as exc:
+        raise GraphNotPublishedError(
+            f"Data service has not published the {city_slug} graph"
+        ) from exc
+    graph = ensure_connected_graph(ox.load_graphml(
+        cache_path, edge_dtypes={"speed_kph": str, "travel_time": str},
+    ))
+    after = cache_path.stat()
+    revision = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+    if revision != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise OSError("Shared graph changed while loading; retrying a complete publication")
+    # Only the data service may assign/adopt a durable graph identity. Legacy
+    # GraphML waits for that publisher to migrate it; routing never rewrites it.
+    require_revision(graph.graph, "graph_revision")
+    # This process-local stat tuple only detects replacement; it is not identity.
+    graph.graph["_routing_graph_revision"] = revision
     return graph
 
 
+def tag_values(value: Any) -> list[str]:
+    value = normalize_listish(value)
+    if isinstance(value, (list, tuple, set)):
+        return [part for item in value for part in tag_values(item)]
+    if value is None:
+        return []
+    if isinstance(value, bool):
+        return ["yes" if value else "no"]
+    return [part.strip().lower() for part in str(value).split(";") if part.strip()]
+
+
+def parsed_speed_kph(value: Any) -> float | None:
+    """Finite positive km/h; aggregated/list speeds use the lowest valid value."""
+    speeds = []
+    for part in tag_values(value):
+        match = re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)(?:e([+-]?\d+))?\s*(km/h|kmh|kph|mph|knots)?", part)
+        if match is None:
+            continue
+        number = match[1] + (f"e{match[2]}" if match[2] is not None else "")
+        speed = float(number) * {"mph": 1.609344, "knots": 1.852}.get(match[3], 1.0)
+        if math.isfinite(speed) and speed > 0:
+            speeds.append(speed)
+    return min(speeds) if speeds else None
+
+
 def normalize_speed_kph(raw_speed: Any, road_type: str) -> float:
-    raw_speed = normalize_listish(raw_speed)
-    if isinstance(raw_speed, list):
-        raw_speed = raw_speed[0] if raw_speed else None
-    if isinstance(raw_speed, str):
-        cleaned = raw_speed.replace("km/h", "").replace("kph", "").strip()
-        cleaned = cleaned.split(";", 1)[0].strip()
-        try:
-            return max(float(cleaned), 1.0)
-        except ValueError:
-            return ROAD_SPEEDS_KPH.get(road_type, ROAD_SPEEDS_KPH["unknown"])
-    if raw_speed is None:
-        return ROAD_SPEEDS_KPH.get(road_type, ROAD_SPEEDS_KPH["unknown"])
-    try:
-        return max(float(raw_speed), 1.0)
-    except (TypeError, ValueError):
-        return ROAD_SPEEDS_KPH.get(road_type, ROAD_SPEEDS_KPH["unknown"])
+    speed = parsed_speed_kph(raw_speed)
+    fallback_type = road_type.removesuffix("_link")
+    return speed if speed is not None else ROAD_SPEEDS_KPH.get(fallback_type, ROAD_SPEEDS_KPH["unknown"])
 
 
-def fetch_city_scores(city: str) -> tuple[dict[str, float], float]:
+def osm_travel_direction(data: dict[str, Any]) -> str | None:
+    """OSMnx reversed is relative to its normalized path, not always the OSM way.
+
+    Normalized oneway=True loses the original yes/-1 distinction. Directional
+    tags on that legacy representation are therefore ambiguous and fail closed.
+    """
+    reversed_values = set(tag_values(data.get("reversed")))
+    if reversed_values not in ({"yes"}, {"no"}):
+        return None
+    oneway = normalize_listish(data.get("oneway"))
+    if isinstance(oneway, bool) and oneway:
+        return None
+    values = set(tag_values(oneway))
+    if len(values) > 1:
+        return None
+    reverse_path = values in ({"-1"}, {"reverse"})
+    backward = (reversed_values == {"yes"}) != reverse_path
+    return "backward" if backward else "forward"
+
+
+def vehicle_speed_kph(data: dict[str, Any], vehicle: str = "car") -> float:
+    road_types = tag_values(data.get("highway") or data.get("road_type")) or ["unknown"]
+    direction = osm_travel_direction(data)
+    mode_key = VEHICLE_ACCESS_KEYS[vehicle][0]
+    limits = []
+    for base_key in ("maxspeed", f"maxspeed:{mode_key}"):
+        directional = data.get(f"{base_key}:{direction}") if direction else None
+        limit = parsed_speed_kph(directional)
+        if limit is None:
+            limit = parsed_speed_kph(data.get(base_key))
+        if limit is not None:
+            limits.append(limit)
+    speed = parsed_speed_kph(data.get("speed_kph"))
+    if speed is None:
+        speed = min(limits) if limits else min(normalize_speed_kph(None, road_type) for road_type in road_types)
+    return min(speed, VEHICLE_SPEED_CAPS_KPH[vehicle], *limits)
+
+
+def access_tags_allow(data: dict[str, Any], vehicle: str, direction: str | None = None) -> bool:
+    keys = VEHICLE_ACCESS_KEYS[vehicle]
+    # Permissions, purpose, dimensions and conditional rules are not in the
+    # request model. Do not assume the vehicle satisfies a represented limit.
+    if any(tag_values(data.get(f"{key}{suffix}")) for key in DIMENSION_RESTRICTIONS
+           for suffix in ("", ":conditional", ":forward", ":backward", ":forward:conditional", ":backward:conditional")):
+        return False
+    for key in keys:
+        if any(tag_values(data.get(f"{key}{suffix}:conditional"))
+               for suffix in ("", ":forward", ":backward")):
+            return False
+        if direction is None:
+            directional_values = [data.get(f"{key}:{side}") for side in ("forward", "backward")]
+            if any(tag_values(value) and not set(tag_values(value)) <= PUBLIC_ACCESS_VALUES
+                   for value in directional_values):
+                return False
+        else:
+            values = tag_values(data.get(f"{key}:{direction}"))
+            if values:
+                return set(values) <= PUBLIC_ACCESS_VALUES
+        values = tag_values(data.get(key))
+        if values:
+            return set(values) <= PUBLIC_ACCESS_VALUES
+    return True
+
+
+def vehicle_edge_allowed(data: dict[str, Any], vehicle: str) -> bool:
+    direction = osm_travel_direction(data)
+    if not access_tags_allow(data, vehicle, direction):
+        return False
+    keys = VEHICLE_ACCESS_KEYS[vehicle][:-1]
+    if any(tag_values(data.get(f"oneway:{key}:conditional")) for key in keys):
+        return False
+    if tag_values(data.get("oneway:conditional")):
+        return False
+    for key in (*[f"oneway:{key}" for key in keys], "oneway"):
+        value = data.get(key)
+        values = set(tag_values(value))
+        if not values:
+            continue
+        if values <= {"no", "0", "false"}:
+            break
+        if key == "oneway" and isinstance(value, bool):
+            # OSMnx already directed this edge, including original oneway=-1.
+            if set(tag_values(data.get("reversed"))) == {"yes"}:
+                return False
+            break
+        if values <= {"yes", "1", "true"}:
+            if direction != "forward":
+                return False
+        elif values <= {"-1", "reverse"}:
+            if direction != "backward":
+                return False
+        else:
+            return False
+        break
+    mode_key = VEHICLE_ACCESS_KEYS[vehicle][0]
+    # Unevaluated conditional speed limits and ambiguous directional limits must
+    # not silently become a faster unrestricted edge.
+    for key in ("maxspeed", f"maxspeed:{mode_key}"):
+        if any(tag_values(data.get(f"{key}{suffix}:conditional"))
+               for suffix in ("", ":forward", ":backward")):
+            return False
+        if direction is None and any(tag_values(data.get(f"{key}:{side}")) for side in ("forward", "backward")):
+            return False
+    road_types = set(tag_values(data.get("highway") or data.get("road_type")))
+    explicit_mode_access = set(tag_values(data.get(mode_key)))
+    mode_permitted = bool(explicit_mode_access) and explicit_mode_access <= PUBLIC_ACCESS_VALUES
+    if road_types & {"construction", "proposed", "abandoned", "steps"}:
+        return False
+    if not mode_permitted:
+        if vehicle == "bike" and (road_types & {"motorway", "motorway_link"}
+                                   or "yes" in tag_values(data.get("motorroad"))):
+            return False
+        if vehicle != "bike" and road_types & {"cycleway", "footway", "path", "pedestrian", "bridleway"}:
+            return False
+    return True
+
+
+def vehicle_node_allowed(data: dict[str, Any], vehicle: str) -> bool:
+    if not access_tags_allow(data, vehicle):
+        return False
+    barriers = set(tag_values(data.get("barrier"))) - {"no"}
+    if barriers:
+        # No gate state/clearance is supplied. Explicit mode permission is needed.
+        mode_key = VEHICLE_ACCESS_KEYS[vehicle][0]
+        permission = set(tag_values(data.get(mode_key)))
+        return bool(permission) and permission <= PUBLIC_ACCESS_VALUES
+    return True
+
+
+def fetch_city_scores(
+    city: str,
+    graph_revision: str,
+) -> tuple[dict[str, float], float, dict[str, str], str]:
     score_request = request.Request(f"{data_service_url()}/scores/{city}", method="GET")
     with request.urlopen(score_request, timeout=60) as response:
         payload = json.loads(response.read().decode("utf-8"))
 
+    if require_revision(payload, "graph_revision") != graph_revision:
+        raise RevisionCompatibilityError("City scores belong to a different graph revision")
+    score_revision = require_revision(payload, "score_revision")
     raw_scores = payload.get("scores", {})
+    if not isinstance(raw_scores, dict):
+        raise ValueError("Data service returned a non-object scores payload")
     updated_at = float(payload.get("updated_at", 0.0) or 0.0)
-    return ({str(key): float(value) for key, value in raw_scores.items()}, updated_at)
+    scores = {str(key): float(value) for key, value in raw_scores.items()}
+    if not math.isfinite(updated_at) or any(
+        not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in scores.values()
+    ):
+        raise ValueError("Data service returned invalid scores or update time")
+    raw_edge_sources = payload.get("edge_sources", {})
+    aggregate_source = canonical_provenance(
+        payload.get("provenance_source") or payload.get("source")
+    )
+    fallback_source = (
+        aggregate_source
+        if aggregate_source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        else PROVENANCE_ML_SYNTHETIC
+    )
+    edge_sources: dict[str, str] = {}
+    for segment_id in scores:
+        edge_source = canonical_provenance(
+            raw_edge_sources.get(segment_id, fallback_source)
+            if isinstance(raw_edge_sources, dict)
+            else fallback_source
+        )
+        edge_sources[segment_id] = (
+            PROVENANCE_UNKNOWN
+            if edge_source == PROVENANCE_HYBRID
+            else edge_source
+        )
+    return scores, updated_at, edge_sources, score_revision
 
 
-def safe_fetch_city_scores(city: str) -> tuple[dict[str, float], float]:
+def safe_fetch_city_scores(
+    city: str,
+    graph_revision: str,
+) -> tuple[dict[str, float], float, dict[str, str], str]:
     try:
-        return fetch_city_scores(city)
+        return fetch_city_scores(city, graph_revision)
+    except RevisionCompatibilityError:
+        # A successful but incompatible response must not become a ready state.
+        raise
     except (TimeoutError, error.URLError, OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"[scores] failed to fetch {city}: {exc}")
-        return {}, 0.0
+        return {}, 0.0, {}, "unavailable"
+
+
+def edge_travel_time_seconds(data: dict[str, Any], vehicle: str = "car") -> float:
+    try:
+        length = float(data.get("length"))
+    except (TypeError, ValueError, OverflowError):
+        return math.inf
+    if not math.isfinite(length) or length <= 0:
+        return math.inf
+    # Graph travel_time may be stale or car-specific. Recompute for this vehicle.
+    return length * 3.6 / vehicle_speed_kph(data, vehicle)
 
 
 def annotate_base_graph(graph):
-    graph = add_edge_speeds_and_times(graph)
+    # Do not overwrite edge speeds with OSMnx's city-wide imputation. The same
+    # explicit vehicle speed policy drives preparation, corridor overrides and ETA.
     travel_times: list[float] = []
 
     for edge_index, (u, v, key, data) in enumerate(graph.edges(keys=True, data=True)):
         geometry = edge_geometry(graph, u, v, data)
         lat, lon = midpoint_lat_lon(geometry)
         road_type = normalize_highway(data.get("highway"))
-        travel_time = float(data.get("travel_time") or data.get("length") or 1.0)
-        length = float(data.get("length") or 1.0)
-        default_weight = max(length / 30.0, 0.001)
+        try:
+            length = float(data.get("length"))
+        except (TypeError, ValueError):
+            length = math.nan
+        if not math.isfinite(length) or length <= 0:
+            length = math.nan
+        normalized_time_data = {
+            **data,
+            "length": length,
+            "road_type": road_type,
+        }
+        travel_time = edge_travel_time_seconds(normalized_time_data)
         data["edge_index"] = edge_index
         data["segment_id"] = f"{u}-{v}-{key}"
         data["road_type"] = road_type
@@ -868,23 +1147,35 @@ def annotate_base_graph(graph):
         data["mid_lon"] = lon
         data["length"] = length
         data["travel_time"] = travel_time
-        data["connectivity_score"] = float(data.get("connectivity_score") or 0.5)
-        data["speed_kph"] = normalize_speed_kph(data.get("speed_kph"), road_type)
-        data["composite_cost"] = float(data.get("composite_cost", default_weight))
-        travel_times.append(travel_time)
+        # GraphML is topology, not a verified score publication.
+        data["connectivity_score"] = 0.5
+        data["provenance_source"] = PROVENANCE_ML_SYNTHETIC
+        data["composite_cost"] = float(data.get("composite_cost", travel_time))
+        if math.isfinite(travel_time):
+            travel_times.append(travel_time)
 
     min_time = min(travel_times) if travel_times else 0.0
     max_time = max(travel_times) if travel_times else 1.0
     spread = max(max_time - min_time, 1e-9)
     for _, _, _, data in graph.edges(keys=True, data=True):
-        data["travel_time_norm"] = (float(data["travel_time"]) - min_time) / spread
+        seconds = float(data["travel_time"])
+        data["travel_time_norm"] = (seconds - min_time) / spread if math.isfinite(seconds) else 1.0
 
     return graph
 
 
-def apply_scores_to_base_graph(graph, scores: dict[str, float]) -> None:
+def apply_scores_to_base_graph(
+    graph,
+    scores: dict[str, float],
+    edge_sources: dict[str, str] | None = None,
+) -> None:
+    provided_sources = edge_sources or {}
     for _, _, _, data in graph.edges(keys=True, data=True):
-        data["connectivity_score"] = float(scores.get(str(data["segment_id"]), 0.5))
+        segment_id = str(data["segment_id"])
+        data["connectivity_score"] = float(scores.get(segment_id, 0.5))
+        data["provenance_source"] = canonical_provenance(
+            provided_sources.get(segment_id, PROVENANCE_ML_SYNTHETIC)
+        )
 
 
 def haversine_meters(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
@@ -902,6 +1193,17 @@ def haversine_meters(a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> 
 
 def is_night_hour(hour: int) -> bool:
     return hour in {20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6}
+
+
+def city_local_hour(city: str, timestamp: float | None = None) -> int:
+    offset_minutes = CITY_UTC_OFFSETS_MINUTES.get(normalize_city(city), 0)
+    city_timezone = timezone(timedelta(minutes=offset_minutes))
+    instant = time.time() if timestamp is None else float(timestamp)
+    return datetime.fromtimestamp(instant, tz=city_timezone).hour
+
+
+def city_risk_time_bucket(city: str, timestamp: float | None = None) -> str:
+    return "night" if is_night_hour(city_local_hour(city, timestamp)) else "day"
 
 
 def flood_zone_label(city: str, lat: float, lon: float) -> str | None:
@@ -1005,29 +1307,34 @@ def haversine_meters_vectorized(xp, latitudes, longitudes, target_lat: float, ta
 
 
 def fallback_edge_weight(edge_data: dict[str, Any]) -> float:
-    return max(float(edge_data.get("length", 50.0)) / 30.0, 0.001)
+    """Legacy time-estimate helper; unindexed routing edges never use this."""
+    return edge_travel_time_seconds(edge_data)
 
 
 def multiedge_weight_lookup(weights_cpu: np.ndarray):
-    def weight(_: Any, __: Any, edge_data: dict[str, Any]) -> float:
-        if "edge_index" in edge_data:
-            edge_index = edge_data.get("edge_index")
-            if isinstance(edge_index, int) and 0 <= edge_index < len(weights_cpu):
-                return float(weights_cpu[edge_index])
-            return fallback_edge_weight(edge_data)
-
-        best_weight: float | None = None
-        for attrs in edge_data.values():
-            edge_index = attrs.get("edge_index")
-            if isinstance(edge_index, int) and 0 <= edge_index < len(weights_cpu):
-                candidate = float(weights_cpu[edge_index])
-            else:
-                candidate = fallback_edge_weight(attrs)
-            if best_weight is None or candidate < best_weight:
-                best_weight = candidate
-        return best_weight if best_weight is not None else 1.0
+    def weight(_: Any, __: Any, edge_data: dict[str, Any]) -> float | None:
+        selected = select_weighted_edge(edge_data, weights_cpu)
+        # NetworkX Dijkstra interprets None as a hidden edge, unlike infinity
+        # which can still produce an all-prohibited path.
+        return selected[2] if selected is not None else None
 
     return weight
+
+
+def select_weighted_edge(edges: dict[Any, dict[str, Any]], weights_cpu: np.ndarray):
+    selected = None
+    for key, attrs in edges.items():
+        index = attrs.get("edge_index")
+        if isinstance(index, bool) or not isinstance(index, (int, np.integer)):
+            continue
+        if not 0 <= index < len(weights_cpu):
+            continue
+        cost = float(weights_cpu[index])
+        if not math.isfinite(cost) or cost <= 0:
+            continue
+        if selected is None or cost < selected[2]:
+            selected = (key, attrs, cost)
+    return selected
 
 
 def shortest_path_nodes(graph, origin_node, destination_node, weights_cpu: np.ndarray):
@@ -1039,25 +1346,7 @@ def shortest_path_nodes(graph, origin_node, destination_node, weights_cpu: np.nd
     )
 
 
-def astar_path_nodes(graph, origin_node, destination_node, weights_cpu: np.ndarray):
-    def heuristic(node_a: Any, node_b: Any) -> float:
-        return haversine_meters(
-            float(graph.nodes[node_a]["y"]),
-            float(graph.nodes[node_a]["x"]),
-            float(graph.nodes[node_b]["y"]),
-            float(graph.nodes[node_b]["x"]),
-        ) / 33.33
-
-    return nx.astar_path(
-        graph,
-        origin_node,
-        destination_node,
-        heuristic=heuristic,
-        weight=multiedge_weight_lookup(weights_cpu),
-    )
-
-
-def validate_path(graph, path_nodes: list[Any]) -> None:
+def validate_path(graph, path_nodes: list[Any], weights_cpu: np.ndarray | None = None) -> None:
     if len(path_nodes) < 2:
         raise ValueError("Path must contain at least two nodes")
 
@@ -1068,6 +1357,8 @@ def validate_path(graph, path_nodes: list[Any]) -> None:
     for start, end in zip(path_nodes, path_nodes[1:]):
         if graph.get_edge_data(start, end) is None:
             raise ValueError(f"Path discontinuity between nodes {start} and {end}")
+        if weights_cpu is not None:
+            resolve_edge(graph, start, end, weights_cpu)
 
 
 def compute_path_with_fallbacks(
@@ -1076,57 +1367,27 @@ def compute_path_with_fallbacks(
     destination_node: Any,
     weights_cpu: np.ndarray,
 ) -> list[Any]:
-    path_attempts = [
-        (
-            "weighted dijkstra",
-            lambda: shortest_path_nodes(graph, origin_node, destination_node, weights_cpu),
-        ),
-        (
-            "reverse weighted dijkstra",
-            lambda: list(reversed(shortest_path_nodes(graph, destination_node, origin_node, weights_cpu))),
-        ),
-        (
-            "unweighted shortest path",
-            lambda: nx.shortest_path(graph, origin_node, destination_node, weight=None),
-        ),
-        (
-            "A* path",
-            lambda: astar_path_nodes(graph, origin_node, destination_node, weights_cpu),
-        ),
-    ]
-
-    last_error: Exception | None = None
-    for label, resolver in path_attempts:
-        try:
-            path_nodes = resolver()
-            validate_path(graph, path_nodes)
-            if label != "weighted dijkstra":
-                print(f"[routing] fallback pathfinder succeeded via {label}")
-            return path_nodes
-        except nx.NetworkXNoPath as exc:
-            last_error = exc
-            print(f"[routing] {label} failed: no path")
-        except Exception as exc:
-            last_error = exc
-            print(f"[routing] {label} failed: {type(exc).__name__}: {exc}")
-
-    print(f"[routing] No path found: {origin_node} -> {destination_node}")
-    print(f"[routing] Graph nodes: {graph.number_of_nodes()}")
-    print(f"[routing] Origin in graph: {origin_node in graph.nodes}")
-    print(f"[routing] Dest in graph: {destination_node in graph.nodes}")
-    if last_error is not None:
-        print(f"[routing] Last routing error: {type(last_error).__name__}: {last_error}")
-    raise HTTPException(
-        status_code=422,
-        detail=(
-            "No route found. The selected points may be in disconnected areas. "
-            "Try points closer to main roads."
-        ),
-    )
+    # Never reverse a route or drop its weights to manufacture a successful path.
+    if origin_node == destination_node:
+        raise HTTPException(status_code=422, detail=NO_ROUTE_DETAIL)
+    try:
+        path_nodes = shortest_path_nodes(graph, origin_node, destination_node, weights_cpu)
+        validate_path(graph, path_nodes, weights_cpu)
+        return path_nodes
+    except (nx.NetworkXNoPath, nx.NodeNotFound) as exc:
+        raise HTTPException(status_code=422, detail=NO_ROUTE_DETAIL) from exc
 
 
-def precompute_vehicle_graph(city: str, base_graph, vehicle: str, scores_updated_at: float) -> PreparedVehicleGraph:
-    hour = time.localtime().tm_hour
+def precompute_vehicle_graph(
+    city: str,
+    base_graph,
+    vehicle: str,
+    scores_updated_at: float,
+    *,
+    hour: int | None = None,
+) -> PreparedVehicleGraph:
+    hour = city_local_hour(city) if hour is None else int(hour) % 24
+    risk_time_bucket = "night" if is_night_hour(hour) else "day"
     profile = VEHICLE_PROFILES[vehicle]
     edge_rows = list(base_graph.edges(keys=True, data=True))
 
@@ -1146,21 +1407,28 @@ def precompute_vehicle_graph(city: str, base_graph, vehicle: str, scores_updated
             highway_mask=to_bool_device_array(np.zeros(0, dtype=bool)),
             below_tolerance_mask=to_bool_device_array(np.zeros(0, dtype=bool)),
             stable_mask=to_bool_device_array(np.zeros(0, dtype=bool)),
+            risk_time_bucket=risk_time_bucket,
+            risk_hour=hour,
             computed_at=time.time(),
             source_scores_updated_at=scores_updated_at,
         )
 
     edge_count = len(edge_rows)
-    lengths_np = np.asarray([float(data.get("length", 50.0)) for _, _, _, data in edge_rows], dtype=np.float32)
-    travel_times_np = np.asarray([float(data.get("travel_time", 1.0)) for _, _, _, data in edge_rows], dtype=np.float32)
-    max_time_in_graph = float(np.max(travel_times_np)) if travel_times_np.size else 1.0
-    travel_norms_np = np.asarray([float(data.get("travel_time_norm", 0.0)) for _, _, _, data in edge_rows], dtype=np.float32)
+    travel_times_np = np.asarray(
+        [edge_travel_time_seconds(data, vehicle) for _, _, _, data in edge_rows],
+        dtype=np.float64,
+    )
+    allowed_np = np.asarray([
+        vehicle_edge_allowed(data, vehicle)
+        and vehicle_node_allowed(base_graph.nodes[u], vehicle)
+        and vehicle_node_allowed(base_graph.nodes[v], vehicle)
+        for u, v, _, data in edge_rows
+    ], dtype=bool) & np.isfinite(travel_times_np)
     scores_np = np.clip(
         np.asarray([float(data.get("connectivity_score", 0.5)) for _, _, _, data in edge_rows], dtype=np.float32),
         0.0,
         1.0,
     )
-    speed_kph_np = np.asarray([float(data.get("speed_kph", 25.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     latitudes_np = np.asarray([float(data.get("mid_lat", 0.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     longitudes_np = np.asarray([float(data.get("mid_lon", 0.0)) for _, _, _, data in edge_rows], dtype=np.float32)
     road_types = np.asarray([str(data.get("road_type", "unknown")) for _, _, _, data in edge_rows], dtype=object)
@@ -1176,16 +1444,13 @@ def precompute_vehicle_graph(city: str, base_graph, vehicle: str, scores_updated
 
     def compute_cost_arrays(use_gpu: bool) -> dict[str, Any]:
         xp = array_backend(use_gpu)
-        lengths = xp.asarray(lengths_np, dtype=xp.float32)
-        travel_times = xp.asarray(travel_times_np, dtype=xp.float32)
-        travel_norms = xp.asarray(travel_norms_np, dtype=xp.float32)
+        allowed = xp.asarray(allowed_np, dtype=xp.bool_)
+        # Use harmless values for prohibited edges during intermediate arithmetic;
+        # their final costs are infinity in every mode.
+        time_cost = xp.asarray(np.where(allowed_np, travel_times_np, 1.0), dtype=xp.float64)
         scores = xp.clip(xp.asarray(scores_np, dtype=xp.float32), 0.0, 1.0)
-        speed_kph = xp.asarray(speed_kph_np, dtype=xp.float32)
         latitudes = xp.asarray(latitudes_np, dtype=xp.float32)
         longitudes = xp.asarray(longitudes_np, dtype=xp.float32)
-
-        speed_mps = xp.maximum(speed_kph * (1000.0 / 3600.0), 1.0)
-        time_cost = xp.where(travel_times > 0, travel_times, lengths / speed_mps).astype(xp.float32)
 
         base_multipliers = xp.ones(edge_count, dtype=xp.float32)
         risk_points = xp.zeros(edge_count, dtype=xp.float32)
@@ -1250,25 +1515,21 @@ def precompute_vehicle_graph(city: str, base_graph, vehicle: str, scores_updated
             stable_mask = xp.zeros(edge_count, dtype=xp.bool_)
 
         combined_multiplier = xp.maximum(base_multipliers * vehicle_multiplier, 1.0)
-        normalized_time_cost = xp.maximum(
-            (time_cost / max(max_time_in_graph, 1.0)) * combined_multiplier,
-            0.001,
-        )
-        fastest_cost = xp.maximum(
-            MODE_WEIGHTS["fastest"]["time"] * normalized_time_cost
-            - MODE_WEIGHTS["fastest"]["coverage"] * scores,
-            0.001,
+        composite_cost = (
+            float(profile["speed"]) * time_cost
+            + float(profile["connectivity"]) * (1.0 - scores) * time_cost
+            + float(profile["risk"]) * combined_multiplier * time_cost
         ).astype(xp.float32)
-        balanced_cost = xp.maximum(
-            MODE_WEIGHTS["balanced"]["time"] * normalized_time_cost
-            - MODE_WEIGHTS["balanced"]["coverage"] * scores,
-            0.001,
+        fastest_cost = time_cost
+        balanced_cost = xp.maximum(composite_cost, 0.001).astype(xp.float32)
+        connected_cost = xp.where(
+            scores > 0.35,
+            balanced_cost + (1.0 - scores) * time_cost * 0.75 + (combined_multiplier - 1.0) * time_cost,
+            1e12,
         ).astype(xp.float32)
-        connected_cost = xp.maximum(
-            MODE_WEIGHTS["connected"]["time"] * normalized_time_cost
-            - MODE_WEIGHTS["connected"]["coverage"] * (scores * CONNECTED_COVERAGE_BONUS),
-            0.001,
-        ).astype(xp.float32)
+        fastest_cost = xp.where(allowed, fastest_cost, xp.inf)
+        balanced_cost = xp.where(allowed, balanced_cost, xp.inf)
+        connected_cost = xp.where(allowed, connected_cost, xp.inf)
 
         return {
             "scores": scores,
@@ -1312,9 +1573,31 @@ def precompute_vehicle_graph(city: str, base_graph, vehicle: str, scores_updated
         below_tolerance_mask=computed["below_tolerance_mask"],
         stable_mask=computed["stable_mask"],
         flood_labels=flood_labels,
+        risk_time_bucket=risk_time_bucket,
+        risk_hour=hour,
         computed_at=time.time(),
         source_scores_updated_at=scores_updated_at,
     )
+
+
+def score_snapshot_id(graph: Any, score_revision: str) -> str:
+    """A constant-size identity; no graph/score-array hash on route admission."""
+    graph_revision = require_revision(graph.graph, "graph_revision")
+    require_revision({"score_revision": score_revision}, "score_revision")
+    return hashlib.blake2b(
+        json.dumps([graph_revision, score_revision]).encode("utf-8"), digest_size=20,
+    ).hexdigest()
+
+
+def graph_publication_is_current(state: GraphState) -> bool:
+    revision = state.base_graph.graph.get("_routing_graph_revision")
+    if revision is None:
+        return True
+    try:
+        current = graph_cache_path(state.city).stat()
+    except OSError:
+        return False
+    return revision == (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns)
 
 
 def build_graph_state(city: str) -> GraphState:
@@ -1323,26 +1606,35 @@ def build_graph_state(city: str) -> GraphState:
     city_slug = normalize_city(city)
     now = time.time()
     cached_state = GRAPH_CACHE.get(city_slug)
-    if cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs:
+    if (cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs
+            and graph_publication_is_current(cached_state)):
         ACTIVE_CITY = city_slug
         return cached_state
 
     with CITY_LOCKS[city_slug]:
         now = time.time()
         cached_state = GRAPH_CACHE.get(city_slug)
-        if cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs:
+        if (cached_state and cached_state.expires_at > now and cached_state.vehicle_graphs
+                and graph_publication_is_current(cached_state)):
             ACTIVE_CITY = city_slug
             return cached_state
 
         graph = load_or_fetch_graph(city_slug)
         graph = annotate_base_graph(graph)
-        scores, updated_at = safe_fetch_city_scores(city_slug)
-        if scores:
-            apply_scores_to_base_graph(graph, scores)
+        graph_revision = require_revision(graph.graph, "graph_revision")
+        scores, updated_at, edge_sources, score_revision = safe_fetch_city_scores(city_slug, graph_revision)
+        apply_scores_to_base_graph(graph, scores, edge_sources)
 
         node_index = build_node_index(graph)
+        risk_hour = city_local_hour(city_slug)
         vehicle_graphs = {
-            vehicle: precompute_vehicle_graph(city_slug, graph, vehicle, updated_at)
+            vehicle: precompute_vehicle_graph(
+                city_slug,
+                graph,
+                vehicle,
+                updated_at,
+                hour=risk_hour,
+            )
             for vehicle in VEHICLE_PROFILES
         }
         state = GraphState(
@@ -1353,7 +1645,12 @@ def build_graph_state(city: str) -> GraphState:
             edge_count=graph.number_of_edges(),
             node_index=node_index,
             vehicle_graphs=vehicle_graphs,
+            snapshot_id=score_snapshot_id(graph, score_revision),
+            graph_revision=graph_revision,
+            score_revision=score_revision,
         )
+        if not graph_publication_is_current(state):
+            raise RevisionCompatibilityError("Graph replaced while preparing its score snapshot")
         ACTIVE_CITY = city_slug
         GRAPH_CACHE[city_slug] = state
         if USE_CUPY:
@@ -1371,12 +1668,23 @@ def build_graph_state(city: str) -> GraphState:
         return state
 
 
+def graph_is_ready(city: str) -> bool:
+    city_slug = normalize_city(city)
+    state = GRAPH_CACHE.get(city_slug)
+    return bool(
+        GRAPH_STATUS.get(city_slug) == "ready"
+        and state is not None
+        and state.expires_at > time.time()
+        and state.vehicle_graphs
+        and graph_publication_is_current(state)
+    )
+
+
 def require_graph_state(city: str) -> GraphState:
     city_slug = normalize_city(city)
     state = GRAPH_CACHE.get(city_slug)
-    now = time.time()
 
-    if state and state.expires_at > now and state.vehicle_graphs and GRAPH_STATUS.get(city_slug) == "ready":
+    if graph_is_ready(city_slug) and state is not None:
         return state
 
     status = GRAPH_STATUS.get(city_slug, "idle")
@@ -1387,45 +1695,110 @@ def require_graph_state(city: str) -> GraphState:
     raise HTTPException(status_code=503, detail="Graph not loaded")
 
 
-def rebuild_vehicle_graphs(city: str, updated_at: float) -> None:
-    state = GRAPH_CACHE.get(city)
-    if state is None:
-        return
-
+def rebuild_vehicle_graphs(
+    state: GraphState,
+    scores: dict[str, float],
+    updated_at: float,
+    edge_sources: dict[str, str],
+    graph_revision: str,
+    score_revision: str,
+    expected_score_revision: str,
+) -> None:
     try:
-        new_graphs = {
-            vehicle: precompute_vehicle_graph(city, state.base_graph, vehicle, updated_at)
-            for vehicle in VEHICLE_PROFILES
-        }
-        with state.lock:
+        # Serialize score and time-bucket writers. Existing routes keep references
+        # to the previous graph and arrays while we prepare their replacements.
+        with CITY_LOCKS[state.city], state.lock:
+            if (GRAPH_CACHE.get(state.city) is not state
+                    or not graph_publication_is_current(state)
+                    or graph_revision != state.graph_revision
+                    or expected_score_revision != state.score_revision
+                    or score_revision == state.score_revision):
+                return
+            require_revision({"score_revision": score_revision}, "score_revision")
+            new_base_graph = state.base_graph.copy()
+            apply_scores_to_base_graph(new_base_graph, scores, edge_sources)
+            risk_hour = city_local_hour(state.city)
+            new_graphs = {
+                vehicle: precompute_vehicle_graph(
+                    state.city, new_base_graph, vehicle, updated_at, hour=risk_hour,
+                )
+                for vehicle in VEHICLE_PROFILES
+            }
+            snapshot_id = score_snapshot_id(new_base_graph, score_revision)
+            if not graph_publication_is_current(state):
+                return
+            state.base_graph = new_base_graph
             state.vehicle_graphs = new_graphs
             state.scores_updated_at = updated_at
-            state.score_refreshing = False
-        print(f"[weights] refreshed precomputed weights for {city}")
+            state.snapshot_id = snapshot_id
+            state.score_revision = score_revision
+        print(f"[weights] refreshed precomputed weights for {state.city}")
     except Exception as exc:
+        print(f"[weights] failed to recompute {state.city}: {exc}")
+    finally:
         with state.lock:
             state.score_refreshing = False
-        print(f"[weights] failed to recompute {city}: {exc}")
+
+
+def ensure_current_risk_weights(state: GraphState) -> RouteSnapshot:
+    with state.lock:
+        required_hour = city_local_hour(state.city)
+        required_bucket = "night" if is_night_hour(required_hour) else "day"
+        if not state.vehicle_graphs or any(
+            prepared.risk_time_bucket != required_bucket
+            for prepared in state.vehicle_graphs.values()
+        ):
+            state.vehicle_graphs = {
+                vehicle: precompute_vehicle_graph(
+                    state.city, state.base_graph, vehicle, state.scores_updated_at,
+                    hour=required_hour,
+                )
+                for vehicle in VEHICLE_PROFILES
+            }
+            print(f"[weights] refreshed {state.city} risk weights for {required_bucket}")
+        return RouteSnapshot(
+            base_graph=state.base_graph,
+            node_index=state.node_index,
+            vehicle_graphs=state.vehicle_graphs,
+            scores_updated_at=state.scores_updated_at,
+            snapshot_id=state.snapshot_id,
+            graph_revision=state.graph_revision,
+            score_revision=state.score_revision,
+        )
 
 
 def refresh_scores_for_city(city: str) -> None:
     state = GRAPH_CACHE.get(city)
-    if state is None or GRAPH_STATUS.get(city) != "ready":
-        return
-
-    scores, updated_at = safe_fetch_city_scores(city)
-    if not scores:
-        return
-    if updated_at <= state.scores_updated_at and state.scores_updated_at > 0:
+    if (state is None or GRAPH_STATUS.get(city) != "ready"
+            or not graph_publication_is_current(state)):
         return
 
     with state.lock:
         if state.score_refreshing:
             return
-        apply_scores_to_base_graph(state.base_graph, scores)
         state.score_refreshing = True
+        graph_revision = state.graph_revision
+        expected_score_revision = state.score_revision
 
-    THREAD_POOL.submit(rebuild_vehicle_graphs, city, updated_at)
+    submitted = False
+    try:
+        scores, updated_at, edge_sources, score_revision = safe_fetch_city_scores(city, graph_revision)
+        if (score_revision == "unavailable" or GRAPH_CACHE.get(city) is not state
+                or not graph_publication_is_current(state)):
+            return
+        THREAD_POOL.submit(
+            rebuild_vehicle_graphs, state, scores, updated_at, edge_sources,
+            graph_revision, score_revision, expected_score_revision,
+        )
+        submitted = True
+    except RevisionCompatibilityError as exc:
+        # Keep the last compatible snapshot. The ordinary periodic refresh is
+        # single-flight; there is no nested/unbounded mismatch retry loop.
+        print(f"[scores] rejected incompatible refresh for {city}: {exc}")
+    finally:
+        if not submitted:
+            with state.lock:
+                state.score_refreshing = False
 
 
 def score_refresh_loop() -> None:
@@ -1450,35 +1823,54 @@ async def preload_city_graph(city: str) -> None:
     GRAPH_STATUS[city_slug] = "loading"
     GRAPH_ERRORS.pop(city_slug, None)
 
-    try:
-        await asyncio.to_thread(request_data_service_preload, city_slug)
-        await asyncio.to_thread(build_graph_state, city_slug)
-        GRAPH_STATUS[city_slug] = "ready"
-        print(f"[graph] {city_slug} ready")
-    except Exception as exc:
-        GRAPH_STATUS[city_slug] = "error"
-        GRAPH_ERRORS[city_slug] = str(exc)
-        print(f"[graph] {city_slug} failed to load: {exc}")
+    # A retry cycle stays loading, including its bounded backoff. Only exhaustion
+    # or a nontransient failure publishes the terminal graph_unavailable state.
+    publication_deadline = time.monotonic() + GRAPH_PUBLICATION_WAIT_SECONDS
+    attempt = 0
+    await asyncio.to_thread(request_data_service_preload, city_slug)
+    while True:
+        try:
+            await asyncio.to_thread(build_graph_state, city_slug)
+            GRAPH_STATUS[city_slug] = "ready"
+            GRAPH_ERRORS.pop(city_slug, None)
+            print(f"[graph] {city_slug} ready")
+            return
+        except Exception as exc:
+            if isinstance(exc, GraphNotPublishedError):
+                remaining = publication_deadline - time.monotonic()
+                if remaining > 0:
+                    await asyncio.sleep(min(GRAPH_LOAD_RETRY_SECONDS, remaining))
+                    continue
+                # Waiting for the owning service is distinct from retrying a
+                # failed read. Do not turn a normal cold start into a 15s error.
+                transient = False
+            else:
+                transient = isinstance(exc, (OSError, error.URLError))
+            if transient and attempt + 1 < GRAPH_LOAD_MAX_ATTEMPTS:
+                await asyncio.sleep(GRAPH_LOAD_RETRY_SECONDS * (2 ** attempt))
+                attempt += 1
+                continue
+            GRAPH_STATUS[city_slug] = "error"
+            GRAPH_ERRORS[city_slug] = str(exc)
+            print(f"[graph] {city_slug} failed to load: {exc}")
+            return
 
 
 def validate_point(name: str, point: list[float]) -> tuple[float, float]:
     if len(point) != 2:
         raise HTTPException(status_code=422, detail=f"{name} must contain [lat, lon].")
-    return float(point[0]), float(point[1])
+    lat, lon = float(point[0]), float(point[1])
+    if not math.isfinite(lat) or not math.isfinite(lon) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise HTTPException(status_code=422, detail=f"{name} must contain valid latitude and longitude.")
+    return lat, lon
 
 
 def resolve_edge(graph, u: int, v: int, weights_cpu: np.ndarray):
     edges = graph.get_edge_data(u, v)
-    if not edges:
-        raise HTTPException(status_code=500, detail=f"Edge data missing between nodes {u} and {v}.")
-    return min(
-        edges.items(),
-        key=lambda item: (
-            float(weights_cpu[item[1]["edge_index"]])
-            if isinstance(item[1].get("edge_index"), int) and item[1]["edge_index"] < len(weights_cpu)
-            else fallback_edge_weight(item[1])
-        ),
-    )
+    selected = select_weighted_edge(edges or {}, weights_cpu)
+    if selected is None:
+        raise HTTPException(status_code=422, detail=NO_ROUTE_DETAIL)
+    return selected[0], selected[1]
 
 
 def serialize_node(node: Any) -> Any:
@@ -1647,24 +2039,16 @@ def corridor_edge_inputs(
     return edge_coords, edge_lookup
 
 
-def connected_signal_floor_graph(graph, effective_scores: np.ndarray, minimum_score: float = 0.4):
-    allowed_edges = []
-    for u, v, key, data in graph.edges(keys=True, data=True):
-        edge_index = data.get("edge_index")
-        if not isinstance(edge_index, int) or edge_index < 0 or edge_index >= len(effective_scores):
-            continue
-        if float(effective_scores[edge_index]) > minimum_score:
-            allowed_edges.append((u, v, key))
-    return graph.edge_subgraph(allowed_edges).copy()
-
-
 def fetch_corridor_scores(
     origin: tuple[float, float],
     destination: tuple[float, float],
     edge_coords: dict[str, list[float]],
-) -> tuple[dict[str, float], str, int, float]:
+    city: str,
+    graph_revision: str,
+    score_revision: str,
+) -> tuple[dict[str, float], str, int, float, float, dict[str, str], str | None]:
     if not edge_coords:
-        return {}, "ML estimate", 0, 0.0
+        return {}, PROVENANCE_ML_SYNTHETIC, 0, 0.0, 0.0, {}, "empty"
 
     padding_km = get_corridor_padding(origin, destination)
     corridor_request = request.Request(
@@ -1675,6 +2059,9 @@ def fetch_corridor_scores(
                 "destination": [destination[0], destination[1]],
                 "edge_coords": edge_coords,
                 "padding_km": padding_km,
+                "city": city,
+                "graph_revision": graph_revision,
+                "score_revision": score_revision,
             }
         ).encode("utf-8"),
         headers={"Content-Type": "application/json"},
@@ -1683,39 +2070,99 @@ def fetch_corridor_scores(
     try:
         with request.urlopen(corridor_request, timeout=60) as response:
             payload = json.loads(response.read().decode("utf-8"))
+        if (require_revision(payload, "graph_revision") != graph_revision
+                or require_revision(payload, "base_score_revision") != score_revision):
+            raise RevisionCompatibilityError("Corridor scores do not match the request snapshot")
+        corridor_score_revision = require_revision(payload, "score_revision")
     except Exception as exc:
-        print(f"[routing] corridor score fetch failed, using ML estimate: {exc}")
-        return {}, "ML estimate", 0, 0.0
+        print(f"[routing] corridor scores unavailable; retaining compatible city scores: {exc}")
+        return (
+            {},
+            PROVENANCE_ML_SYNTHETIC,
+            0,
+            0.0,
+            0.0,
+            {segment_id: PROVENANCE_ML_SYNTHETIC for segment_id in edge_coords},
+            None,
+        )
 
     raw_scores = payload.get("scores", {})
     if not isinstance(raw_scores, dict):
         raw_scores = {}
+    scores: dict[str, float] = {}
+    for segment_id, score in raw_scores.items():
+        segment_key = str(segment_id)
+        if segment_key not in edge_coords:
+            continue
+        try:
+            numeric_score = float(score)
+            if math.isfinite(numeric_score):
+                scores[segment_key] = max(0.0, min(1.0, numeric_score))
+        except (TypeError, ValueError):
+            continue
 
-    source = str(payload.get("source") or "ML estimate")
-    normalized_source = source.strip().lower()
-    if "opencell" in normalized_source or "real" in normalized_source:
-        source_label = "OpenCellID"
-    elif normalized_source == "trai":
-        source_label = "TRAI"
-    else:
-        source_label = "ML estimate"
+    source = canonical_provenance(payload.get("provenance_source") or payload.get("source"))
+    real_data_source = canonical_provenance(payload.get("real_data_source"))
+    raw_edge_sources = payload.get("edge_sources", {})
+    if not isinstance(raw_edge_sources, dict):
+        raw_edge_sources = {}
+    edge_sources: dict[str, str] = {}
+    for segment_id in edge_coords:
+        if segment_id not in scores:
+            edge_sources[segment_id] = PROVENANCE_ML_SYNTHETIC
+            continue
+        explicit_source = canonical_provenance(raw_edge_sources.get(segment_id))
+        if explicit_source != PROVENANCE_UNKNOWN:
+            edge_sources[segment_id] = explicit_source
+        elif source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI, PROVENANCE_ML_SYNTHETIC}:
+            edge_sources[segment_id] = source
+        elif real_data_source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}:
+            edge_sources[segment_id] = real_data_source
+        else:
+            edge_sources[segment_id] = PROVENANCE_UNKNOWN
 
-    print(f"[routing-debug] route source: {source_label}")
+    scores = {
+        segment_id: score
+        for segment_id, score in scores.items()
+        if edge_sources.get(segment_id) != PROVENANCE_ML_SYNTHETIC
+    }
 
     return (
-        {str(segment_id): float(score) for segment_id, score in raw_scores.items()},
-        source_label,
+        scores,
+        source,
         int(payload.get("tower_count") or 0),
-        float(payload.get("coverage_percent") or payload.get("real_data_percent") or 0.0),
+        first_payload_percentage(
+            payload,
+            "real_data_coverage_percent",
+            "coverage_percent",
+            "real_data_percent",
+        ),
+        first_payload_percentage(payload, "good_signal_percent"),
+        edge_sources,
+        corridor_score_revision,
     )
 
 
-def push_corridor_scores_to_tiles(city: str, route_scores: dict[str, float]) -> None:
+def push_corridor_scores_to_tiles(
+    city: str,
+    route_scores: dict[str, float],
+    edge_sources: dict[str, str],
+    graph_revision: str,
+    base_score_revision: str,
+    score_revision: str,
+) -> None:
     if not route_scores:
         return
     feedback_request = request.Request(
         f"{data_service_url()}/corridor-feedback/{city}",
-        data=json.dumps({"scores": route_scores}).encode("utf-8"),
+        data=json.dumps(
+            {
+                "scores": route_scores, "edge_sources": edge_sources,
+                "graph_revision": graph_revision,
+                "base_score_revision": base_score_revision,
+                "score_revision": score_revision,
+            }
+        ).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -1723,19 +2170,15 @@ def push_corridor_scores_to_tiles(city: str, route_scores: dict[str, float]) -> 
         with request.urlopen(feedback_request, timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
         print(
-            f"[tiles] invalidated corridor tiles with real scores "
+            f"[tiles] applied corridor score feedback "
             f"({int(payload.get('updated_edges') or 0)} edges)"
         )
     except Exception as exc:
         print(f"[tiles] corridor feedback skipped for {city}: {exc}")
 
 
-def edge_time_cost(data: dict[str, Any]) -> float:
-    length = float(data.get("length", 50.0) or 50.0)
-    speed_kph = normalize_speed_kph(data.get("speed_kph"), str(data.get("road_type", "unknown")))
-    speed_mps = max(speed_kph * (1000.0 / 3600.0), 1.0)
-    travel_time = float(data.get("travel_time", 0.0) or 0.0)
-    return max(travel_time if travel_time > 0 else length / speed_mps, 0.001)
+def edge_time_cost(data: dict[str, Any], vehicle: str = "car") -> float:
+    return edge_travel_time_seconds(data, vehicle)
 
 
 def compute_scalar_route_cost(
@@ -1747,43 +2190,62 @@ def compute_scalar_route_cost(
     *,
     hour: int | None = None,
 ) -> tuple[float, dict[str, Any]]:
-    current_hour = time.localtime().tm_hour if hour is None else hour
+    profile = VEHICLE_PROFILES[vehicle]
+    current_hour = city_local_hour(city) if hour is None else hour
     risk_profile = base_risk_profile(city, data, current_hour, score_override=score)
-    time_cost = max(float(data.get("travel_time_norm", 0.0)), 0.001)
+    time_cost = edge_time_cost(data, vehicle)
+    allowed = vehicle_edge_allowed(data, vehicle) and math.isfinite(time_cost)
+    if not allowed:
+        time_cost = 1.0
 
-    vehicle_profile = VEHICLE_PROFILES[vehicle]
     vehicle_multiplier = 1.0
     reasons = list(risk_profile["reasons"])
 
-    if vehicle_profile.get("avoid_highways") and str(data.get("road_type", "unknown")) in {"motorway", "trunk"}:
+    if profile.get("avoid_highways") and str(data.get("road_type", "unknown")) in {"motorway", "trunk"}:
         vehicle_multiplier *= 1.35
         reasons.append("vehicle profile avoids highways")
 
-    dead_zone_deficit = max(float(vehicle_profile["dead_zone_tolerance"]) - score, 0.0)
+    dead_zone_deficit = max(float(profile["dead_zone_tolerance"]) - score, 0.0)
     if dead_zone_deficit > 0:
         vehicle_multiplier *= 1.0 + dead_zone_deficit * 2.5
         reasons.append("below vehicle dead-zone tolerance")
 
     stable_penalty = False
-    if vehicle_profile.get("require_stable_v2x") and score < 0.55:
+    if profile.get("require_stable_v2x") and score < 0.55:
         vehicle_multiplier *= 1.6
         stable_penalty = True
         reasons.append("truck profile requires stable V2X")
 
     combined_multiplier = max(float(risk_profile["multiplier"]) * vehicle_multiplier, 1.0)
-    weighted_time_cost = time_cost * combined_multiplier
-    coverage_score = weighted_coverage_score(mode, score)
-    cost = route_mode_cost(mode, weighted_time_cost, coverage_score)
+    score_penalty = (1.0 - score) * time_cost
+    composite_cost = (
+        float(profile["speed"]) * time_cost
+        + float(profile["connectivity"]) * score_penalty
+        + float(profile["risk"]) * combined_multiplier * time_cost
+    )
+
+    if mode == "fastest":
+        cost = time_cost
+    elif mode == "connected":
+        cost = (
+            composite_cost
+            + score_penalty * 0.75
+            + max(combined_multiplier - 1.0, 0.0) * time_cost
+            if score > 0.35
+            else 1e12
+        )
+    else:
+        cost = composite_cost
 
     risk_points = float(risk_profile["risk_points"])
-    if str(data.get("road_type", "")) in {"motorway", "trunk"} and vehicle_profile.get("avoid_highways"):
+    if str(data.get("road_type", "")) in {"motorway", "trunk"} and profile.get("avoid_highways"):
         risk_points = min(1.0, risk_points + 0.15)
     if dead_zone_deficit > 0:
         risk_points = min(1.0, risk_points + min(0.4, dead_zone_deficit * 2.0))
     if stable_penalty:
         risk_points = min(1.0, risk_points + 0.25)
 
-    return float(max(cost, 0.001)), {
+    return (float(cost if mode == "fastest" else max(cost, 0.001)) if allowed else math.inf), {
         "score": float(max(0.0, min(1.0, score))),
         "risk_points": risk_points,
         "risk_level": risk_level_for_values(score, risk_points),
@@ -1796,49 +2258,75 @@ def compute_scalar_route_cost(
 def compute_route(city: str, origin: tuple[float, float], destination: tuple[float, float], mode: str, vehicle: str) -> dict[str, Any]:
     city_slug = normalize_city(city)
     state = require_graph_state(city_slug)
-
-    prepared = state.vehicle_graphs.get(vehicle)
+    snapshot = ensure_current_risk_weights(state)
+    prepared = snapshot.vehicle_graphs.get(vehicle)
     if prepared is None:
         raise HTTPException(status_code=503, detail="Vehicle graph unavailable")
+    flight_key = (city_slug, origin, destination, mode, vehicle,
+                  snapshot.snapshot_id, prepared.risk_time_bucket)
+    with ROUTE_FLIGHTS_LOCK:
+        future = ROUTE_FLIGHTS.get(flight_key)
+        owner = future is None
+        if owner:
+            future = Future()
+            ROUTE_FLIGHTS[flight_key] = future
+    if not owner:
+        return deepcopy(future.result())
+    try:
+        response = compute_route_from_snapshot(city_slug, origin, destination, mode, vehicle, snapshot)
+        future.set_result(response)
+        return deepcopy(response)
+    except BaseException as exc:
+        future.set_exception(exc)
+        raise
+    finally:
+        with ROUTE_FLIGHTS_LOCK:
+            ROUTE_FLIGHTS.pop(flight_key, None)
 
-    cached_response = get_cached_route(
-        city_slug,
-        origin,
-        destination,
-        mode,
-        vehicle,
-        max(state.scores_updated_at, prepared.source_scores_updated_at),
-    )
-    if cached_response is not None:
-        return cached_response
 
-    graph = state.base_graph
+def compute_route_from_snapshot(
+    city_slug: str, origin: tuple[float, float], destination: tuple[float, float],
+    mode: str, vehicle: str, snapshot: RouteSnapshot,
+) -> dict[str, Any]:
+    prepared = snapshot.vehicle_graphs[vehicle]
+    graph = snapshot.base_graph
     weight_array = weight_array_for_mode(prepared, mode)
-    weights_cpu = to_numpy_array(weight_array).astype(np.float32, copy=False)
-    effective_scores = to_numpy_array(prepared.scores).astype(np.float32, copy=False)
-    missing_weights = sum(
-        1
-        for _, _, _, data in graph.edges(keys=True, data=True)
-        if "composite_cost" not in data
-    )
-    if missing_weights > 0:
-        print(f"[routing] WARNING: {missing_weights} edges missing composite_cost")
-        for _, _, _, data in graph.edges(keys=True, data=True):
-            if "composite_cost" not in data:
-                data["composite_cost"] = fallback_edge_weight(data)
-
+    weights_cpu = to_numpy_array(weight_array).astype(np.float64, copy=False)
     corridor_edge_coords, corridor_edge_lookup = corridor_edge_inputs(graph, origin, destination)
-    corridor_scores, signal_source, tower_count, coverage_percent = fetch_corridor_scores(
+    (
+        corridor_scores,
+        signal_source,
+        tower_count,
+        corridor_real_data_coverage,
+        corridor_good_signal_percent,
+        corridor_edge_sources,
+        corridor_score_revision,
+    ) = fetch_corridor_scores(
         origin,
         destination,
         corridor_edge_coords,
+        city_slug,
+        snapshot.graph_revision,
+        snapshot.score_revision,
     )
+    # Corridor observations can change without a city-wide score publication.
+    # Validate their revision before cache lookup. Unavailable/mismatched replies
+    # fall back to this request's city snapshot and are never cached as coverage.
+    if corridor_score_revision is not None:
+        cached_response = get_cached_route(
+            city_slug, origin, destination, mode, vehicle,
+            snapshot.scores_updated_at, prepared.risk_time_bucket,
+            snapshot.snapshot_id, corridor_score_revision,
+        )
+        if cached_response is not None:
+            return cached_response
     corridor_risk_details: dict[int, dict[str, Any]] = {}
     if corridor_scores:
-        weights_cpu = np.array(weights_cpu, dtype=np.float32, copy=True)
-        effective_scores = np.array(effective_scores, dtype=np.float32, copy=True)
-        current_hour = time.localtime().tm_hour
+        weights_cpu = np.array(weights_cpu, dtype=np.float64, copy=True)
+        current_hour = prepared.risk_hour
         for edge_index, data in corridor_edge_lookup.items():
+            if not 0 <= edge_index < len(weights_cpu) or not math.isfinite(weights_cpu[edge_index]):
+                continue
             segment_id = str(data.get("segment_id") or "")
             if not segment_id:
                 continue
@@ -1853,45 +2341,23 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
                 float(score),
                 hour=current_hour,
             )
-            weights_cpu[edge_index] = np.float32(updated_weight)
-            effective_scores[edge_index] = np.float32(score)
+            # Connectivity changes the metrics for fastest, never its objective.
+            if mode != "fastest":
+                weights_cpu[edge_index] = updated_weight
             corridor_risk_details[edge_index] = risk_details
         print(
             f"[routing] applied corridor scores for {len(corridor_risk_details)} edges "
             f"from {signal_source} ({tower_count} towers)"
         )
-    elif coverage_percent == 0.0:
-        signal_source = "ML estimate"
-        tower_count = 0
     else:
-        print(
-            f"[routing] retained {signal_source} source with coverage "
-            f"{coverage_percent:.1f}% but no corridor edge overrides"
-        )
+        signal_source = PROVENANCE_ML_SYNTHETIC
 
-    origin_node = find_nearest_node(graph, origin[0], origin[1], state.node_index)
-    destination_node = find_nearest_node(graph, destination[0], destination[1], state.node_index)
+    origin_node = find_nearest_node(graph, origin[0], origin[1], snapshot.node_index)
+    destination_node = find_nearest_node(graph, destination[0], destination[1], snapshot.node_index)
 
     try:
-        if mode == "connected":
-            constrained_graph = connected_signal_floor_graph(graph, effective_scores)
-            if origin_node in constrained_graph.nodes and destination_node in constrained_graph.nodes:
-                try:
-                    path_nodes = compute_path_with_fallbacks(
-                        constrained_graph,
-                        origin_node,
-                        destination_node,
-                        weights_cpu,
-                    )
-                except HTTPException:
-                    print("[routing] connected mode: no strong-signal path found, relaxing signal floor")
-                    path_nodes = compute_path_with_fallbacks(graph, origin_node, destination_node, weights_cpu)
-            else:
-                print("[routing] connected mode: no strong-signal path found, relaxing signal floor")
-                path_nodes = compute_path_with_fallbacks(graph, origin_node, destination_node, weights_cpu)
-        else:
-            path_nodes = compute_path_with_fallbacks(graph, origin_node, destination_node, weights_cpu)
-        validate_path(graph, path_nodes)
+        path_nodes = compute_path_with_fallbacks(graph, origin_node, destination_node, weights_cpu)
+        validate_path(graph, path_nodes, weights_cpu)
     except Exception as exc:
         if isinstance(exc, HTTPException):
             raise
@@ -1926,7 +2392,10 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
 
     edge_times: list[float] = []
     route_scores: list[float] = []
+    route_provenance: list[str] = []
+    route_real_data: list[bool] = []
     route_score_payload: dict[str, float] = {}
+    route_score_sources: dict[str, str] = {}
 
     for index, (u, v, data) in enumerate(path_edges):
         geometry = edge_geometry(graph, u, v, data)
@@ -1957,20 +2426,37 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
         )
         route_scores.append(score)
         segment_id = str(data.get("segment_id") or "")
-        if segment_id and signal_source == "OpenCellID":
+        base_provenance_source = canonical_provenance(
+            data.get("provenance_source", PROVENANCE_ML_SYNTHETIC)
+        )
+        is_real_override = bool(segment_id and segment_id in corridor_scores)
+        provenance_source = (
+            canonical_provenance(
+                corridor_edge_sources.get(segment_id, PROVENANCE_UNKNOWN)
+            )
+            if is_real_override
+            else base_provenance_source
+        )
+        route_provenance.append(provenance_source)
+        route_real_data.append(
+            provenance_source in {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+        )
+        if is_real_override:
             route_score_payload[segment_id] = round(score, 3)
+            route_score_sources[segment_id] = provenance_source
         for lon, lat in oriented_coords:
             route_points.append({"lat": lat, "lon": lon, "risk": risk_level})
         signal_segments.append(
             {
                 "segment_id": segment_id,
-                "coordinates": [[lat, lon] for lon, lat in oriented_coords],
+                "coordinates": [[lat, lon] for lon, lat in coords],
                 "score": round(score, 3),
                 "risk": risk_level,
+                "provenance_source": provenance_source,
             }
         )
 
-        edge_times.append(float(data.get("travel_time", 0.0)))
+        edge_times.append(edge_time_cost(data, vehicle))
         if override_details:
             reasons = list(dict.fromkeys(str(reason) for reason in override_details["reasons"]))
             flood_label = override_details.get("flood_zone_label")
@@ -2001,7 +2487,7 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
                 "surface_type": data.get("surface_type"),
                 "length": float(data.get("length", 1.0)),
                 "score": score,
-                "travel_time": float(data.get("travel_time", 0.0)),
+                "travel_time": edge_time_cost(data, vehicle),
                 "travel_time_norm": float(data.get("travel_time_norm", 0.0)),
                 "risk_level": risk_level,
                 "risk_points": risk_points,
@@ -2014,6 +2500,36 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
     total_time_minutes = round(sum(edge_times) / 60.0, 1) if edge_times else 0.0
     avg_connectivity = round(float(np.mean(route_scores)), 3) if route_scores else 0.0
     route_signal_percent = round(avg_connectivity * 100.0, 1)
+    good_signal_percent = round(
+        (sum(1 for score in route_scores if score >= 0.6) / max(len(route_scores), 1)) * 100.0,
+        1,
+    ) if route_scores else 0.0
+    real_sources = {PROVENANCE_OPENCELLID, PROVENANCE_TRAI}
+    real_edge_count = sum(1 for is_real in route_real_data if is_real)
+    real_data_coverage_percent = round(
+        (real_edge_count / max(len(route_provenance), 1)) * 100.0,
+        1,
+    ) if route_provenance else 0.0
+    route_source_set = set(route_provenance)
+    if not route_source_set:
+        signal_source = PROVENANCE_UNKNOWN
+    elif PROVENANCE_UNKNOWN in route_source_set:
+        signal_source = PROVENANCE_UNKNOWN
+    elif 0 < real_edge_count < len(route_real_data):
+        signal_source = PROVENANCE_HYBRID
+    elif real_edge_count == len(route_real_data):
+        known_real_sources = route_source_set & real_sources
+        signal_source = (
+            next(iter(known_real_sources))
+            if len(known_real_sources) == 1
+            and route_source_set <= (known_real_sources | {PROVENANCE_UNKNOWN})
+            and PROVENANCE_UNKNOWN not in route_source_set
+            else PROVENANCE_UNKNOWN
+        )
+    elif route_source_set == {PROVENANCE_ML_SYNTHETIC}:
+        signal_source = PROVENANCE_ML_SYNTHETIC
+    else:
+        signal_source = PROVENANCE_UNKNOWN
     if len(path_nodes) < 2 or len(coordinates) < 2:
         print(
             f"[routing] invalid route result: nodes={len(path_nodes)} coordinates={len(coordinates)} "
@@ -2021,16 +2537,23 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
         )
         raise HTTPException(
             status_code=422,
-            detail=(
-                "No route found. The selected points may be in disconnected areas. "
-                "Try points closer to main roads."
-            ),
+            detail=NO_ROUTE_DETAIL,
         )
     explanation = build_explanation(city_slug, mode, vehicle, edge_snapshots, avg_connectivity)
-    if signal_source == "OpenCellID" and route_score_payload:
-        push_corridor_scores_to_tiles(city_slug, route_score_payload)
+    if route_score_payload and corridor_score_revision is not None:
+        push_corridor_scores_to_tiles(
+            city_slug,
+            route_score_payload,
+            route_score_sources,
+            snapshot.graph_revision,
+            snapshot.score_revision,
+            corridor_score_revision,
+        )
 
     response = {
+        "graph_revision": snapshot.graph_revision,
+        "score_revision": snapshot.score_revision,
+        "corridor_score_revision": corridor_score_revision,
         "mode": mode,
         "vehicle": vehicle,
         "nodes": [serialize_node(node) for node in path_nodes],
@@ -2044,29 +2567,27 @@ def compute_route(city: str, origin: tuple[float, float], destination: tuple[flo
         "avg_connectivity": avg_connectivity,
         "route_signal_percent": route_signal_percent,
         "signal_source": signal_source,
+        "provenance_source": signal_source,
         "tower_count": tower_count,
-        "coverage_percent": coverage_percent,
+        "real_data_coverage_percent": real_data_coverage_percent,
+        "coverage_percent": real_data_coverage_percent,
+        "real_data_percent": real_data_coverage_percent,
+        "good_signal_percent": good_signal_percent,
+        "edge_sources": {
+            segment["segment_id"]: segment["provenance_source"]
+            for segment in signal_segments
+            if segment["segment_id"]
+        },
+        "corridor_real_data_coverage_percent": corridor_real_data_coverage,
+        "corridor_good_signal_percent": corridor_good_signal_percent,
         "explanation": explanation,
     }
-    score_version = max(state.scores_updated_at, prepared.source_scores_updated_at)
-    store_cached_route(
-        city_slug,
-        origin,
-        destination,
-        mode,
-        vehicle,
-        score_version,
-        response,
-    )
-    warn_if_route_signal_gap_is_small(
-        city_slug,
-        origin,
-        destination,
-        vehicle,
-        mode,
-        score_version,
-        route_signal_percent,
-    )
+    if corridor_score_revision is not None:
+        store_cached_route(
+            city_slug, origin, destination, mode, vehicle,
+            snapshot.scores_updated_at, response, prepared.risk_time_bucket,
+            snapshot.snapshot_id, corridor_score_revision,
+        )
     return response
 
 
@@ -2084,16 +2605,16 @@ async def compute_all_routes(
     return await asyncio.gather(*tasks)
 
 
-def schedule_preload(city: str) -> str:
+def schedule_preload(city: str, *, retry_failed: bool = False) -> str:
     city_slug = normalize_city(city)
-    cached_state = GRAPH_CACHE.get(city_slug)
-    if cached_state is not None and cached_state.expires_at > time.time() and cached_state.vehicle_graphs:
-        GRAPH_STATUS[city_slug] = "ready"
+    if graph_is_ready(city_slug):
         return "ready"
 
     current_task = PRELOAD_TASKS.get(city_slug)
     if current_task is not None and not current_task.done():
         return "already loading"
+    if GRAPH_STATUS.get(city_slug) == "error" and not retry_failed:
+        return "error"
 
     GRAPH_STATUS[city_slug] = "loading"
     PRELOAD_TASKS[city_slug] = asyncio.create_task(preload_city_graph(city_slug))
@@ -2109,7 +2630,6 @@ async def startup_event() -> None:
     configure_cpu_affinity()
     load_route_cache()
     APP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     for city in supported_cities():
         GRAPH_STATUS[city] = "idle"
     default_city_slug = default_city()
@@ -2129,28 +2649,20 @@ def shutdown_event() -> None:
     THREAD_POOL.shutdown(wait=False, cancel_futures=True)
 
 
-@app.post("/route")
-async def route(request_model: RouteRequest):
-    try:
-        city_slug = normalize_city(request_model.city)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-
+def graph_loading_response(city_slug: str) -> JSONResponse | None:
     status = GRAPH_STATUS.get(city_slug, "idle")
+    if status not in {"loading", "error"} and not graph_is_ready(city_slug):
+        schedule_preload(city_slug)
+        status = GRAPH_STATUS.get(city_slug, "loading")
     if status == "loading":
         return JSONResponse(
-            status_code=503,
+            status_code=202,
+            headers={"Retry-After": "5"},
             content={
-                "status": "error",
-                "message": "Graph not loaded",
-            },
-        )
-    if status == "idle":
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "error",
-                "message": "Graph not loaded",
+                "status": "loading",
+                "city": city_slug,
+                "message": "Graph is loading",
+                "retry_after": 5,
             },
         )
     if status == "error":
@@ -2158,14 +2670,48 @@ async def route(request_model: RouteRequest):
             status_code=503,
             content={
                 "status": "error",
+                "code": "graph_unavailable",
                 "message": GRAPH_ERRORS.get(city_slug, "Graph unavailable"),
             },
         )
+    return None
+
+
+@app.post("/route")
+async def route(request_model: RouteRequest):
+    try:
+        city_slug = normalize_city(request_model.city)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     origin = validate_point("origin", request_model.origin)
     destination = validate_point("destination", request_model.destination)
+    loading_response = graph_loading_response(city_slug)
+    if loading_response is not None:
+        return loading_response
+
     try:
-        return compute_route(city_slug, origin, destination, request_model.mode, request_model.vehicle)
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            THREAD_POOL, compute_route, city_slug, origin, destination,
+            request_model.mode, request_model.vehicle,
+        )
+    except HTTPException as exc:
+        # The graph may expire or be replaced while this request waits for a
+        # worker. Preserve the same loading contract as admission to /route.
+        if exc.status_code == 503:
+            loading_response = graph_loading_response(city_slug)
+            if loading_response is not None:
+                return loading_response
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "code": "graph_unavailable",
+                    "message": str(exc.detail),
+                },
+            )
+        raise
     finally:
         gc.collect()
         free_gpu_memory()
@@ -2174,7 +2720,7 @@ async def route(request_model: RouteRequest):
 @app.post("/preload/{city}")
 async def preload(city: str) -> dict[str, Any]:
     city_slug = normalize_city(city)
-    preload_status = schedule_preload(city_slug)
+    preload_status = schedule_preload(city_slug, retry_failed=True)
     return {"status": preload_status, "city": city_slug}
 
 
@@ -2251,18 +2797,21 @@ def health() -> dict[str, Any]:
         "gpu_enabled": USE_CUPY,
         "gpu_name": GPU_NAME,
         "active_city": ACTIVE_CITY,
-        "graph_ready": bool(GRAPH_STATUS.get(city_slug) == "ready" and city_slug in GRAPH_CACHE),
+        "graph_ready": graph_is_ready(city_slug),
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    workers = 1 if platform.system() == "Windows" else 4
-    app_target: Any = app if workers == 1 else "main:app"
-    uvicorn.run(
-        app_target,
-        host="0.0.0.0",
-        port=8002,
-        workers=workers,
+@app.get("/ready")
+def ready() -> JSONResponse:
+    city_slug = default_city()
+    graph_ready = graph_is_ready(city_slug)
+    return JSONResponse(
+        status_code=200 if graph_ready else 503,
+        content={
+            "status": "ready" if graph_ready else "not_ready",
+            "service": "routing-engine",
+            "city": city_slug,
+            "graph_ready": graph_ready,
+            "graph_status": GRAPH_STATUS.get(city_slug, "idle"),
+        },
     )

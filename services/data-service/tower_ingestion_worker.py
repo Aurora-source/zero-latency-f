@@ -13,6 +13,7 @@ from tile_loader import (
     cache_status,
     ensure_city_tiles,
     fetch_bbox_towers_live_sync,
+    local_tower_source_status,
     mark_tile_error,
     stale_tile_ids,
     store_tile_towers,
@@ -83,9 +84,10 @@ class TowerIngestionWorker:
             self.logger(f"[tower-cache] queued {queued} tile(s) for {self.city}")
         return queued
 
-    def status(self) -> dict[str, int | float | str]:
+    def status(self) -> dict[str, int | float | str | bool]:
         payload = cache_status(self.db_path, self.city)
         payload["queued_tiles"] = int(self._queue.qsize())
+        payload["ingestion_running"] = self.is_running()
         return payload
 
     def _next_tile(self) -> str | None:
@@ -94,10 +96,15 @@ class TowerIngestionWorker:
         except queue.Empty:
             stale = stale_tile_ids(self.db_path, self.city, limit=1)
             if stale:
-                return stale[0]
+                tile_id = stale[0]
+                with self._lock:
+                    if tile_id in self._queued_ids:
+                        return None
+                    self._queued_ids.add(tile_id)
+                return tile_id
         return None
 
-    def _mark_dequeued(self, tile_id: str) -> None:
+    def _release_tile(self, tile_id: str) -> None:
         with self._lock:
             self._queued_ids.discard(tile_id)
 
@@ -107,21 +114,21 @@ class TowerIngestionWorker:
             if tile_id is None:
                 self._stop.wait(2.0)
                 continue
-            if self.key_manager is not None:
-                if self.key_manager.cooldown_active():
-                    self.logger("[api-key] cooldown active")
-                    self._stop.wait(min(max(self.key_manager.seconds_until_retry(), 1), 30))
-                    continue
-                if not self.key_manager.has_available_key():
-                    self._stop.wait(2.0)
-                    continue
-            self._mark_dequeued(tile_id)
-            result = self._fetch_and_store_tile(tile_id)
-            if result.status == "ok" and self.on_tile_ingested is not None:
-                try:
-                    self.on_tile_ingested(self.city, tile_id, result.tower_count)
-                except Exception as exc:
-                    self.logger(f"[tower-cache] adaptive sync failed for {tile_id}: {exc}")
+            try:
+                if self.key_manager is not None:
+                    if not self.key_manager.wait_until_available(self._stop):
+                        return
+                result = self._fetch_and_store_tile(tile_id)
+                if result.status == "ok" and self.on_tile_ingested is not None:
+                    try:
+                        self.on_tile_ingested(self.city, tile_id, result.tower_count)
+                    except Exception as exc:
+                        self.logger(f"[tower-cache] adaptive sync failed for {tile_id}: {exc}")
+            finally:
+                # The reservation covers fetch, persistence, and the adaptive score
+                # callback. Concurrent corridor requests cannot queue this tile again
+                # until every part of its ingestion attempt has completed.
+                self._release_tile(tile_id)
             if self.request_delay_seconds > 0:
                 self._stop.wait(self.request_delay_seconds)
 
@@ -144,13 +151,36 @@ class TowerIngestionWorker:
                 logger=self.logger,
                 stop_event=self._stop,
             )
-            tower_count = store_tile_towers(self.db_path, tile_id, towers)
+            if self._stop.is_set():
+                return TileIngestionResult(
+                    tile_id=tile_id,
+                    tower_count=0,
+                    status="interrupted",
+                )
+            local_status = local_tower_source_status()
+            source = (
+                str(local_status.get("source") or "unknown")
+                if local_status.get("loaded")
+                else "opencellid"
+            )
+            tower_count = store_tile_towers(
+                self.db_path,
+                tile_id,
+                towers,
+                source=source,
+            )
             self.logger(f"[tile-worker] tile stored {tile_id} ({tower_count} towers)")
             return TileIngestionResult(tile_id=tile_id, tower_count=tower_count, status="ok")
         except Exception as exc:
-            message = f"{type(exc).__name__}: {exc}"
+            if self._stop.is_set():
+                return TileIngestionResult(
+                    tile_id=tile_id,
+                    tower_count=0,
+                    status="interrupted",
+                )
+            message = f"{type(exc).__name__}: tower ingestion failed"
             mark_tile_error(self.db_path, tile_id, message)
-            if "Daily limit exceeded" in message or "429" in message:
+            if type(exc).__name__ == "QuotaExceededError":
                 self.logger(f"[tile-worker] quota detected for {tile_id}")
             self.logger(f"[tower-cache] fetch failed for {tile_id}: {message}")
             return TileIngestionResult(tile_id=tile_id, tower_count=0, status="error", error=message)

@@ -1,0 +1,7 @@
+# Supply via the shell or explicitly via --env-file. No secrets required.
+# Create copies with scripts/prepare-artifacts.py; originals stay immutable.
+ARTIFACT_DIR=./.cache/release-artifacts
+GATEWAY_PORT=8080
+RELEASE_TAG=local
+# Empty is correct for same-origin browser requests through the gateway.
+CORS_ORIGINS=

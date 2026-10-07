@@ -1,28 +1,22 @@
-FROM nvidia/cuda:12.8.0-runtime-ubuntu22.04
-
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
-
+FROM python:3.11.16-slim-bookworm@sha256:a36c24f9cbdf4fd0f52d67f0823eeac19c2028c637cecc392d97f980d4fec56b
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
+ENV VIRTUAL_ENV=/opt/venv PATH="/opt/venv/bin:$PATH"
 WORKDIR /app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3 /usr/bin/python \
-    && ln -sf /usr/bin/pip3 /usr/bin/pip \
-    && python3 -m venv $VIRTUAL_ENV \
-    && $VIRTUAL_ENV/bin/pip install --no-cache-dir --upgrade pip
-
-COPY requirements.txt requirements-gpu.txt ./
-RUN $VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements.txt \
-    && ($VIRTUAL_ENV/bin/pip install --no-cache-dir -r requirements-gpu.txt || true)
-
-COPY main.py ./main.py
-
-RUN mkdir -p /app/models
-
+RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/venv
+COPY services/prediction-service/requirements.lock /tmp/requirements.lock
+RUN /opt/venv/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements.lock \
+    && /opt/venv/bin/python -m pip uninstall -y pip setuptools \
+    && /usr/local/bin/python -m pip uninstall -y pip setuptools
+RUN python -c "from fastapi import FastAPI; from fastapi.middleware.cors import CORSMiddleware; import numpy; assert callable(FastAPI) and callable(CORSMiddleware) and numpy.zeros(1).size == 1; print('Runtime dependencies import successfully')"
+COPY runtime/entrypoint.py /opt/runtime/entrypoint.py
+COPY services/prediction-service/main.py ./
+RUN python -c "from pathlib import Path; files=[Path('/opt/runtime/entrypoint.py'),*Path('/app').glob('*.py')]; assert all(p.stat().st_size for p in files); [compile(p.read_text(),str(p),'exec') for p in files]"
+RUN LOCAL_DATA_ONLY=1 ENV_FILE_PATH=/dev/null ALLOW_MODEL_TRAINING=0 PREDICTION_DEVICE=cpu APP_CACHE_DIR=/tmp/build-check python -c "import main; assert main.app; print('Service imports without artifacts')"
+RUN groupadd --gid 10001 application && useradd --uid 10001 --gid 10001 --no-create-home application \
+    && mkdir -p /runtime/graphs /runtime/towers /runtime/scores \
+    && chown -R application:application /runtime
+USER 10001:10001
 EXPOSE 8003
-
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8003"]
+CMD ["python", "/opt/runtime/entrypoint.py", "prediction-service"]

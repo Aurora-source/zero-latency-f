@@ -1,5 +1,4 @@
 import { motion } from "framer-motion";
-import { memo, useMemo } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -73,18 +72,6 @@ export function routeLabelForStrategy(strategy: Strategy) {
   return "Fastest";
 }
 
-function colorWithAlpha(color: string, alpha: number) {
-  const normalized = color.replace("#", "");
-  if (normalized.length !== 6) {
-    return color;
-  }
-
-  const red = Number.parseInt(normalized.slice(0, 2), 16);
-  const green = Number.parseInt(normalized.slice(2, 4), 16);
-  const blue = Number.parseInt(normalized.slice(4, 6), 16);
-  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
-}
-
 function ScoreBar({
   label,
   value,
@@ -112,7 +99,7 @@ function ScoreBar({
   );
 }
 
-function RouteCardComponent({
+export default function RouteCard({
   route,
   isSelected,
   isExplainOpen,
@@ -121,45 +108,23 @@ function RouteCardComponent({
   delay,
 }: RouteCardProps) {
   const connectivityPercentage = Math.round(route.connectivity * 100);
-  const cardStyle = useMemo(
-    () =>
-      ({
-        backgroundColor: colorWithAlpha(route.color, isSelected ? 0.15 : 0.1),
-        borderColor: colorWithAlpha(route.color, isSelected ? 0.55 : 0.5),
-        borderLeftColor: route.color,
-        borderLeftWidth: isSelected ? "4px" : "1px",
-      }) as const,
-    [isSelected, route.color],
-  );
-  const navigationIconStyle = useMemo(
-    () => ({ color: route.color }),
-    [route.color],
-  );
-  const dividerStyle = useMemo(
-    () => ({ borderTopColor: colorWithAlpha(route.color, isSelected ? 0.22 : 0.16) }),
-    [isSelected, route.color],
-  );
-  const explainButtonStyle = useMemo(
-    () => ({
-      borderColor: colorWithAlpha(route.color, isSelected ? 0.28 : 0.2),
-      backgroundColor: colorWithAlpha(route.color, isSelected ? 0.14 : 0.08),
-    }),
-    [isSelected, route.color],
-  );
 
   return (
     <motion.div
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ delay, duration: 0.25 }}
-      className={`w-full rounded-xl border p-3 transition-all duration-200 backdrop-blur-md ${
-        isSelected ? "scale-[1.02] shadow-lg" : ""
+      className={`w-full rounded-xl border p-3 transition-all duration-200 ${
+        isSelected
+          ? "scale-[1.02] border-blue-400/50 bg-white/20 shadow-lg backdrop-blur-md"
+          : "border-white/20 bg-white/10 backdrop-blur-md"
       }`}
-      style={cardStyle}
     >
       <button
         type="button"
         onClick={onClick}
+        aria-label={`${route.label} route`}
+        aria-pressed={isSelected}
         className="w-full text-left"
       >
         <div className="mb-2.5 flex items-start justify-between">
@@ -168,35 +133,34 @@ function RouteCardComponent({
               className="h-3 w-3 rounded-full"
               style={{ backgroundColor: route.color }}
             />
-            <span className={`text-sm font-semibold ${isSelected ? "text-white" : "text-white/55"}`}>
+            <span className="text-sm font-semibold text-white/90">
               {route.label}
             </span>
           </div>
 
           <Navigation2
             className={`h-3.5 w-3.5 ${
-              isSelected ? "opacity-100" : "opacity-0"
+              isSelected ? "text-blue-400 opacity-100" : "opacity-0"
             }`}
-            style={navigationIconStyle}
           />
         </div>
 
-        <div className={`mb-2.5 flex items-center gap-4 text-xs ${isSelected ? "text-white/80" : "text-white/50"}`}>
+        <div className="mb-2.5 flex items-center gap-4 text-xs text-white/60">
           <div className="flex items-center gap-1.5">
             <Clock className="h-3.5 w-3.5" />
             <span>{route.time}</span>
           </div>
-          <div className={isSelected ? "text-white/45" : "text-white/30"}>|</div>
+          <div className="text-white/40">|</div>
           <span>{route.distance}</span>
         </div>
 
         <div>
           <div className="mb-1 flex items-center justify-between text-xs">
-            <div className={`flex items-center gap-1.5 ${isSelected ? "text-white/75" : "text-white/50"}`}>
+            <div className="flex items-center gap-1.5 text-white/60">
               <Signal className="h-3 w-3" />
-              <span>Coverage</span>
+              <span>Signal estimate</span>
             </div>
-            <span className={`font-semibold ${isSelected ? "text-white" : "text-white/55"}`}>
+            <span className="font-semibold text-white/90">
               {connectivityPercentage}%
             </span>
           </div>
@@ -213,19 +177,17 @@ function RouteCardComponent({
         </div>
       </button>
 
-      <div
-        className="mt-3 flex items-center justify-between gap-3 border-t pt-3"
-        style={dividerStyle}
-      >
-        <span className={`text-[11px] ${isSelected ? "text-white/55" : "text-white/45"}`}>Route details</span>
+      <p className="mt-2 break-words text-[11px] text-amber-100/80">{route.signalDataLabel}</p>
+      <p className="mt-1 text-[11px] text-white/60">{Math.round(route.realDataCoveragePercent)}% provider-backed · {Math.round(route.goodSignalPercent)}% good estimate</p>
+      <p className="mt-1 text-[11px] text-white/60">Moving-time ETA estimate · {route.vehicle}</p>
+
+      <div className="mt-3 flex items-center justify-between gap-3 border-t border-white/10 pt-3">
+        <span className="text-[11px] text-white/45">Route details</span>
 
         <button
           type="button"
           onClick={onToggleExplain}
-          className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition ${
-            isSelected ? "text-white" : "text-white/70"
-          }`}
-          style={explainButtonStyle}
+          className="inline-flex items-center gap-1 rounded-full border border-white/15 bg-white/10 px-2.5 py-1 text-[11px] font-medium text-white/90 transition hover:bg-white/15"
         >
           Explain
           {isExplainOpen ? (
@@ -295,16 +257,3 @@ function RouteCardComponent({
     </motion.div>
   );
 }
-
-const RouteCard = memo(
-  RouteCardComponent,
-  (prevProps, nextProps) =>
-    prevProps.route === nextProps.route &&
-    prevProps.isSelected === nextProps.isSelected &&
-    prevProps.isExplainOpen === nextProps.isExplainOpen &&
-    prevProps.delay === nextProps.delay,
-);
-
-RouteCard.displayName = "RouteCard";
-
-export default RouteCard;

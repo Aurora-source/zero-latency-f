@@ -1,11 +1,45 @@
 import type { Hotspot } from "./supabase";
 
 const API_BASE = "/api";
+export const ROUTE_TIMEOUT_MS = 90_000;
+
+// Include response-body reads in the deadline and propagate input cancellation.
+async function boundedFetch(url: string, init: RequestInit = {}, timeoutMs = 30_000): Promise<Response> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(init.signal?.reason);
+  if (init.signal?.aborted) cancel();
+  init.signal?.addEventListener("abort", cancel, { once: true });
+  let timedOut = false;
+  const timer = window.setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const body = await response.arrayBuffer();
+    return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  } catch (error) {
+    if (timedOut) throw new Error("The request timed out. Try again when the services are ready.");
+    if (init.signal?.aborted) throw error;
+    throw new Error("Cannot reach the local services. Check they are running, then retry.");
+  } finally {
+    window.clearTimeout(timer);
+    init.signal?.removeEventListener("abort", cancel);
+  }
+}
 
 export type Strategy = "fastest" | "balanced" | "connected";
 export type Vehicle = "scooter" | "bike" | "car" | "truck";
 export type RiskLevel = "low" | "medium" | "high";
-export type RouteSignalSource = "OpenCellID" | "TRAI" | "ML estimate";
+export type ProvenanceSource =
+  | "opencellid"
+  | "trai"
+  | "ml_synthetic"
+  | "hybrid"
+  | "unknown";
+export type RouteSignalSource =
+  | "OpenCellID"
+  | "TRAI"
+  | "ML estimate"
+  | "Hybrid"
+  | "Unknown";
 
 export interface RouteExplanationFactor {
   factor: string;
@@ -40,9 +74,13 @@ export interface RouteSignalSegment {
   coordinates: [number, number][];
   score: number;
   risk: RiskLevel;
+  provenanceSource?: ProvenanceSource;
 }
 
 export interface RouteResponse {
+  graphRevision?: string;
+  scoreRevision?: string;
+  corridorScoreRevision?: string | null;
   strategy: Strategy;
   vehicle: Vehicle;
   etaMinutes: number;
@@ -51,8 +89,11 @@ export interface RouteResponse {
   segments: RouteSegment[];
   signalSegments: RouteSignalSegment[];
   signalSource: RouteSignalSource;
+  provenanceSource: ProvenanceSource;
   towerCount: number;
-  coveragePercent: number;
+  routeSignalPercent: number;
+  realDataCoveragePercent: number;
+  goodSignalPercent: number;
   explanation: RouteExplanation;
 }
 
@@ -77,8 +118,11 @@ export interface FormattedRoute {
   segments: RouteSegment[];
   signalSegments: RouteSignalSegment[];
   signalSource: RouteSignalSource;
+  provenanceSource: ProvenanceSource;
   towerCount: number;
-  coveragePercent: number;
+  routeSignalPercent: number;
+  realDataCoveragePercent: number;
+  goodSignalPercent: number;
   signalDataLabel: string;
   explanation: RouteExplanation;
 }
@@ -109,6 +153,9 @@ export interface CorridorTower {
 export interface CorridorTowerResponse {
   towers: CorridorTower[];
   count: number;
+  tower_count: number;
+  source: ProvenanceSource;
+  real_data_coverage_percent: number;
   bbox: {
     min_lat: number;
     min_lon: number;
@@ -119,21 +166,25 @@ export interface CorridorTowerResponse {
 
 export interface CorridorScoreResponse {
   scores: Record<string, number>;
-  source: "OpenCellID" | "ML estimate";
+  edge_sources: Record<string, ProvenanceSource>;
+  source: ProvenanceSource;
   tower_count: number;
+  real_data_coverage_percent: number;
+  good_signal_percent: number;
   bbox: {
     min_lat: number;
     min_lon: number;
     max_lat: number;
     max_lon: number;
   };
-  coverage_percent?: number;
 }
 
 export async function fetchCities(): Promise<string[]> {
-  const res = await fetch(`${API_BASE}/cities`);
+  const res = await boundedFetch(`${API_BASE}/cities`);
   if (!res.ok) throw new Error("Failed to fetch cities");
-  return res.json();
+  const data: unknown = await res.json();
+  if (!Array.isArray(data) || !data.every((city) => typeof city === "string")) throw new Error("The city response is invalid. Retry after checking the data service.");
+  return data;
 }
 
 export interface CityContext {
@@ -144,8 +195,13 @@ export interface CityContext {
 
 export interface ScoreSourceInfo {
   city: string;
-  source: "TRAI" | "OpenCellID" | "ML_synthetic";
+  /** Compatibility display value for the current UI. Prefer provenanceSource. */
+  source: "TRAI" | "OpenCelliD" | "ML_synthetic" | "Hybrid" | "Unknown";
+  provenanceSource: ProvenanceSource;
   tower_count: number;
+  real_data_coverage_percent: number;
+  good_signal_percent: number;
+  /** Legacy field whose historical meaning varied by endpoint. */
   coverage_percent: number;
   dead_zone_percent: number;
   last_updated: string;
@@ -157,16 +213,22 @@ export interface CoverageStatusInfo {
   cached_tiles: number;
   remaining_tiles: number;
   percent_complete: number;
-  coverage_percent: number;
-  real_coverage_tiles: number;
-  real_coverage_percent: number;
+  real_data_coverage_percent: number;
   ingestion_running: boolean;
 }
 
+export async function fetchPredictionReady(): Promise<boolean> {
+  const response = await boundedFetch(`${API_BASE}/ready/prediction`, {}, 5_000);
+  if (!response.ok) return false;
+  const data = await response.json();
+  return data.model_ready === true && data.status === "ready";
+}
+
 export async function fetchCityContext(city: string): Promise<CityContext> {
-  const res = await fetch(`${API_BASE}/city-context/${city}`);
+  const res = await boundedFetch(`${API_BASE}/city-context/${city}`);
   if (!res.ok) throw new Error("Failed to fetch city context");
   const data = await res.json();
+  if (![data.center, data.origin, data.destination].every(validCoordinates)) throw new Error("The city coordinates are invalid.");
   return {
     center: [data.center[0], data.center[1]],
     origin: [data.origin[0], data.origin[1]],
@@ -175,33 +237,52 @@ export async function fetchCityContext(city: string): Promise<CityContext> {
 }
 
 export async function fetchScoreSource(city: string): Promise<ScoreSourceInfo> {
-  const res = await fetch(`${API_BASE}/scores/source/${city}`);
+  const res = await boundedFetch(`${API_BASE}/scores/source/${city}`);
   if (!res.ok) {
     throw new Error("Failed to fetch score source");
   }
-  const data = (await res.json()) as ScoreSourceInfo;
-  const normalized = normalizeSignalSource(data.source);
+  const data = await res.json();
+  const provenanceSource = normalizeProvenanceSource(
+    data.provenance_source ?? data.source,
+  );
+  const goodSignalPercent = asPercent(
+    data.good_signal_percent ?? data.coverage_percent,
+  );
   return {
     ...data,
-    source:
-      normalized === "OpenCellID"
-        ? "OpenCellID"
-        : normalized === "TRAI"
-          ? "TRAI"
-          : "ML_synthetic",
+    source: scoreSourceCompatibilityLabel(provenanceSource),
+    provenanceSource,
+    tower_count: asNumber(data.tower_count),
+    real_data_coverage_percent: asPercent(
+      data.real_data_coverage_percent ?? data.real_coverage_percent,
+    ),
+    good_signal_percent: goodSignalPercent,
+    coverage_percent: asPercent(data.coverage_percent ?? goodSignalPercent),
+    dead_zone_percent: asPercent(data.dead_zone_percent),
   };
 }
 
 export async function fetchCoverageStatus(): Promise<CoverageStatusInfo> {
-  const res = await fetch(`${API_BASE}/cache-status`);
+  const res = await boundedFetch(`${API_BASE}/cache-status`);
   if (!res.ok) {
     throw new Error("Failed to fetch coverage status");
   }
-  return res.json();
+  const data = await res.json();
+  return {
+    city: String(data.city ?? ""),
+    total_tiles: asNumber(data.total_tiles),
+    cached_tiles: asNumber(data.cached_tiles),
+    remaining_tiles: asNumber(data.remaining_tiles),
+    percent_complete: asPercent(data.percent_complete),
+    real_data_coverage_percent: asPercent(
+      data.real_data_coverage_percent ?? data.real_coverage_percent,
+    ),
+    ingestion_running: Boolean(data.ingestion_running),
+  };
 }
 
 export async function preloadCity(city: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/preload/${city}`, { method: "POST" });
+  const res = await boundedFetch(`${API_BASE}/preload/${city}`, { method: "POST" });
   if (!res.ok) {
     throw new Error(await readError(res));
   }
@@ -218,7 +299,7 @@ export async function fetchHotspotsForViewport(
   url.searchParams.set("max_lon", String(viewport.maxLon));
   url.searchParams.set("zoom", String(viewport.zoom));
 
-  const res = await fetch(url.toString());
+  const res = await boundedFetch(url.toString());
   if (!res.ok) {
     throw new Error(await readError(res));
   }
@@ -239,24 +320,40 @@ export async function fetchTowerData(params: {
   url.searchParams.set("dest_lon", String(params.destination[1]));
   url.searchParams.set("padding_km", String(params.paddingKm ?? 3));
 
-  const res = await fetch(url.toString());
+  const res = await boundedFetch(url.toString());
   if (!res.ok) {
     throw new Error(await readError(res));
   }
 
-  return res.json();
+  const data = await res.json();
+  return {
+    ...data,
+    towers: Array.isArray(data.towers) ? data.towers : [],
+    count: asNumber(data.count),
+    tower_count: asNumber(data.tower_count ?? data.count),
+    source: normalizeProvenanceSource(data.provenance_source ?? data.source),
+    real_data_coverage_percent: asPercent(
+      data.real_data_coverage_percent ?? data.coverage_percent,
+    ),
+  };
 }
 
 export async function fetchSignalCoverage(payload: {
+  city: string;
+  graphRevision: string;
+  scoreRevision: string;
   origin: [number, number];
   destination: [number, number];
   edgeCoords: Record<string, [number, number]>;
   paddingKm?: number;
 }): Promise<CorridorScoreResponse> {
-  const res = await fetch(`${API_BASE}/corridor-scores`, {
+  const res = await boundedFetch(`${API_BASE}/corridor-scores`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
+      city: payload.city,
+      graph_revision: payload.graphRevision,
+      score_revision: payload.scoreRevision,
       origin: payload.origin,
       destination: payload.destination,
       edge_coords: payload.edgeCoords,
@@ -268,32 +365,63 @@ export async function fetchSignalCoverage(payload: {
     throw new Error(await readError(res));
   }
 
-  return res.json();
+  const data = await res.json();
+  const scores = Object.fromEntries(
+    Object.entries(asObject(data.scores)).map(([segmentId, score]) => [
+      segmentId,
+      Math.min(1, Math.max(0, asNumber(score))),
+    ]),
+  );
+  const provenanceSource = normalizeProvenanceSource(
+    data.provenance_source ?? data.source,
+  );
+  const rawEdgeSources = asObject(data.edge_sources);
+  const edgeIds = [
+    ...new Set([
+      ...Object.keys(payload.edgeCoords),
+      ...Object.keys(rawEdgeSources),
+      ...Object.keys(scores),
+    ]),
+  ];
+  const edgeSources = Object.fromEntries(
+    edgeIds.map((segmentId) => [
+      segmentId,
+      !(segmentId in scores)
+        ? "ml_synthetic"
+        : segmentId in rawEdgeSources
+          ? normalizeProvenanceSource(rawEdgeSources[segmentId])
+          : provenanceSource === "hybrid"
+            ? "unknown"
+            : provenanceSource,
+    ]),
+  ) as Record<string, ProvenanceSource>;
+  return {
+    ...data,
+    scores,
+    edge_sources: edgeSources,
+    source: provenanceSource,
+    tower_count: asNumber(data.tower_count),
+    real_data_coverage_percent: asPercent(
+      data.real_data_coverage_percent ?? data.coverage_percent,
+    ),
+    good_signal_percent: asPercent(data.good_signal_percent),
+  };
 }
 
-export async function geocodeLocation(query: string): Promise<[number, number]> {
-  const url = new URL("https://nominatim.openstreetmap.org/search");
+export async function geocodeLocation(query: string, signal?: AbortSignal): Promise<[number, number]> {
+  const url = new URL(`${window.location.origin}${API_BASE}/geocode`);
   url.searchParams.set("q", query);
-  url.searchParams.set("format", "json");
-  url.searchParams.set("limit", "1");
 
-  const res = await fetch(url.toString());
+  // Allow the provider's 10-second timeout and serialized-request spacing to
+  // return the useful map/coordinate fallback before the browser deadline.
+  const res = await boundedFetch(url.toString(), { signal }, 15_000);
   if (!res.ok) {
-    throw new Error("Failed to search location");
+    throw new Error(await readError(res));
   }
 
-  const results = (await res.json()) as Array<{ lat: string; lon: string }>;
-  if (!results.length) {
-    throw new Error("Location not found");
-  }
-
-  const lat = Number(results[0].lat);
-  const lon = Number(results[0].lon);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-    throw new Error("Location not found");
-  }
-
-  return [lat, lon];
+  const data = await res.json();
+  if (!validCoordinates(data?.coordinates)) throw new Error("Place search returned invalid coordinates. Pick the map instead.");
+  return data.coordinates;
 }
 
 function haversine(a: [number, number], b: [number, number]): number {
@@ -316,53 +444,146 @@ function routeDistance(coords: [number, number][]): number {
   return meters;
 }
 
-async function readError(res: Response): Promise<string> {
+type JsonObject = Record<string, unknown>;
+
+function asObject(value: unknown): JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as JsonObject)
+    : {};
+}
+
+function asNumber(value: unknown, fallback = 0): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function asPercent(value: unknown): number {
+  return Math.min(100, Math.max(0, asNumber(value)));
+}
+
+async function readResponseValue(res: Response): Promise<unknown> {
+  const text = await res.text();
+  if (!text) return null;
   try {
-    const data = await res.json();
-    if (typeof data?.detail === "string") return data.detail;
-    if (typeof data?.message === "string") return data.message;
+    return JSON.parse(text);
   } catch {
-    const text = await res.text();
-    if (text) return text;
+    return text;
   }
-  return "Route request failed";
 }
 
-function formatSignalSourceLabel(source: string, towerCount: number): string {
-  const normalizedSource = normalizeSignalSource(source);
-  if (normalizedSource === "OpenCellID") {
-    return `OpenCellID (${towerCount} towers in corridor)`;
-  }
-  if (normalizedSource === "TRAI") {
-    return `TRAI India (${towerCount} towers in corridor)`;
-  }
-  return "ML estimate";
+function responseMessage(value: unknown): string | null {
+  if (typeof value === "string") return null;
+  const data = asObject(value);
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail)) return "Check the coordinates, vehicle and routing mode, then try again.";
+  if (typeof data.message === "string") return data.message;
+  return null;
 }
 
-function normalizeSignalSource(source: unknown): RouteSignalSource {
-  if (!source) {
-    return "ML estimate";
-  }
+async function readError(res: Response): Promise<string> {
+  return responseMessage(await readResponseValue(res)) ?? "Route request failed";
+}
 
-  const value = String(source).trim().toLowerCase();
+export function normalizeProvenanceSource(source: unknown): ProvenanceSource {
+  const value = String(source ?? "").trim().toLowerCase();
 
-  if (value.includes("opencell")) {
-    return "OpenCellID";
-  }
-  if (value.includes("real")) {
-    return "OpenCellID";
+  if (
+    value === "opencellid" ||
+    value === "open cell id" ||
+    value === "open_cell_id"
+  ) {
+    return "opencellid";
   }
   if (value === "trai" || value === "trai india") {
-    return "TRAI";
+    return "trai";
   }
-  if (value.includes("ml") || value.includes("synthetic")) {
-    return "ML estimate";
+  if (
+    value === "ml" ||
+    value === "ml estimate" ||
+    value === "ml_synthetic" ||
+    value === "synthetic"
+  ) {
+    return "ml_synthetic";
   }
-  return "ML estimate";
+  if (
+    value === "hybrid" ||
+    value === "mixed" ||
+    value === "mixed_source" ||
+    value === "opencellid+ml"
+  ) {
+    return "hybrid";
+  }
+  return "unknown";
 }
 
-function shouldWarnForMlFallback(source: RouteSignalSource) {
-  return source === "ML estimate";
+function displaySignalSource(source: ProvenanceSource): RouteSignalSource {
+  if (source === "opencellid") return "OpenCellID";
+  if (source === "trai") return "TRAI";
+  if (source === "ml_synthetic") return "ML estimate";
+  if (source === "hybrid") return "Hybrid";
+  return "Unknown";
+}
+
+function scoreSourceCompatibilityLabel(
+  source: ProvenanceSource,
+): ScoreSourceInfo["source"] {
+  if (source === "opencellid") return "OpenCelliD";
+  if (source === "trai") return "TRAI";
+  if (source === "ml_synthetic") return "ML_synthetic";
+  if (source === "hybrid") return "Hybrid";
+  return "Unknown";
+}
+
+function formatSignalSourceLabel(source: ProvenanceSource, towerCount: number): string {
+  if (source === "opencellid") {
+    return `OpenCellID (${towerCount} towers in corridor)`;
+  }
+  if (source === "trai") {
+    return `TRAI India (${towerCount} towers in corridor)`;
+  }
+  if (source === "hybrid") {
+    return `Hybrid real and estimated data (${towerCount} towers in corridor)`;
+  }
+  if (source === "unknown") {
+    return "Unknown signal provenance";
+  }
+  return "Model or fallback estimate";
+}
+
+function retryAfterSeconds(res: Response, data: JsonObject): number {
+  const header = res.headers.get("Retry-After")?.trim();
+  if (header) {
+    const deltaSeconds = Number(header);
+    if (Number.isFinite(deltaSeconds)) {
+      if (deltaSeconds >= 0) return Math.max(1, Math.ceil(deltaSeconds));
+    } else {
+      const retryAt = Date.parse(header);
+      if (Number.isFinite(retryAt)) {
+        return Math.max(1, Math.ceil((retryAt - Date.now()) / 1000));
+      }
+    }
+  }
+
+  const bodyValue = asNumber(data.retry_after ?? data.retryAfter, 10);
+  return bodyValue >= 0 ? Math.max(1, Math.ceil(bodyValue)) : 10;
+}
+
+function isTemporaryLoadingResponse(status: number, data: JsonObject): boolean {
+  if (status === 202) return true;
+  if (status !== 503) return false;
+
+  const state = String(data.status ?? "").trim().toLowerCase();
+  const code = String(data.code ?? "").trim().toLowerCase();
+  const message = responseMessage(data)?.trim().toLowerCase() ?? "";
+  return (
+    state === "loading" ||
+    code === "graph_loading" ||
+    message === "graph not loaded" ||
+    message === "graph is still loading" ||
+    message === "graph is loading" ||
+    message === "graph loading" ||
+    message === "graph loading, please wait..."
+  );
 }
 
 export function isRouteLoadingResponse(
@@ -373,8 +594,9 @@ export function isRouteLoadingResponse(
 
 export async function fetchRoute(
   payload: RouteRequestPayload,
+  signal?: AbortSignal,
 ): Promise<RouteResponse | RouteLoadingResponse> {
-  const res = await fetch(`${API_BASE}/route`, {
+  const res = await boundedFetch(`${API_BASE}/route`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -384,53 +606,111 @@ export async function fetchRoute(
       mode: payload.strategy,
       vehicle: payload.vehicle,
     }),
-  });
+    signal,
+  }, ROUTE_TIMEOUT_MS);
+  const responseValue = await readResponseValue(res);
+  const data = asObject(responseValue);
 
-  if (res.status === 202) {
-    const data = await res.json();
+  if (isTemporaryLoadingResponse(res.status, data)) {
     return {
       status: "loading",
       strategy: payload.strategy,
-      message: data.message ?? "Graph loading, please wait...",
-      retryAfter: Number(data.retry_after ?? 10),
+      message:
+        responseMessage(data) ?? "Graph loading, please wait...",
+      retryAfter: retryAfterSeconds(res, data),
     };
   }
 
   if (!res.ok) {
-    throw new Error(await readError(res));
+    throw new Error(responseMessage(responseValue) ?? "Route request failed");
   }
 
-  const data = await res.json();
+  const pathGeoJson = asObject(data.path_geojson);
+  if (pathGeoJson.type !== "LineString" || !Array.isArray(pathGeoJson.coordinates) || pathGeoJson.coordinates.length < 2 ||
+      !pathGeoJson.coordinates.every((point) => Array.isArray(point) && validCoordinates([point[1], point[0]])) ||
+      typeof data.total_time_min !== "number" || !Number.isFinite(data.total_time_min) || data.total_time_min < 0 ||
+      typeof data.avg_connectivity !== "number" || !Number.isFinite(data.avg_connectivity) || data.avg_connectivity < 0 || data.avg_connectivity > 1 ||
+      (data.vehicle !== undefined && data.vehicle !== payload.vehicle) || (data.mode !== undefined && data.mode !== payload.strategy)) {
+    throw new Error("The routing service returned an invalid route. Please retry.");
+  }
   const coordinates: [number, number][] =
-    data.path_geojson?.coordinates?.map(([lon, lat]: [number, number]) => [
-      lat,
-      lon,
-    ]) ?? [];
-
-  console.log("route coverage:", Number(data.coverage_percent ?? data.real_data_percent ?? 0));
-  console.log("route source:", data.signal_source ?? data.source ?? "ML estimate");
+    Array.isArray(pathGeoJson.coordinates)
+      ? pathGeoJson.coordinates.flatMap((coordinate) => {
+          if (!Array.isArray(coordinate) || coordinate.length < 2) return [];
+          const lon = Number(coordinate[0]);
+          const lat = Number(coordinate[1]);
+          return Number.isFinite(lat) && Number.isFinite(lon)
+            ? ([[lat, lon]] as [number, number][])
+            : [];
+        })
+      : [];
+  const provenanceSource = normalizeProvenanceSource(
+    data.provenance_source ?? data.signal_source ?? data.source,
+  );
+  const routeEdgeSources = asObject(data.edge_sources);
+  if (Array.isArray(data.signal_segments) && !data.signal_segments.every((rawSegment) => {
+    const segment = asObject(rawSegment);
+    return Array.isArray(segment.coordinates) && segment.coordinates.length >= 2 && segment.coordinates.every(validCoordinates) &&
+      typeof segment.score === "number" && Number.isFinite(segment.score) && segment.score >= 0 && segment.score <= 1;
+  })) throw new Error("The routing service returned invalid signal geometry. Please retry.");
+  const signalSegments = Array.isArray(data.signal_segments)
+    ? data.signal_segments.map((rawSegment) => {
+        const segment = asObject(rawSegment);
+        const segmentId = String(segment.segment_id ?? "");
+        return {
+          ...segment,
+          coordinates: Array.isArray(segment.coordinates) ? segment.coordinates : [],
+          provenanceSource: normalizeProvenanceSource(
+            segment.provenance_source ??
+              segment.provenanceSource ??
+              segment.source ??
+              routeEdgeSources[segmentId] ??
+              "unknown",
+          ),
+        } as RouteSignalSegment;
+      })
+    : [];
 
   return {
+    graphRevision: typeof data.graph_revision === "string" ? data.graph_revision : undefined,
+    scoreRevision: typeof data.score_revision === "string" ? data.score_revision : undefined,
+    corridorScoreRevision: typeof data.corridor_score_revision === "string" ? data.corridor_score_revision : null,
     strategy: payload.strategy,
     vehicle: (data.vehicle ?? payload.vehicle) as Vehicle,
-    etaMinutes: data.total_time_min ?? 0,
-    connectivity: data.avg_connectivity ?? 0,
+    etaMinutes: asNumber(data.total_time_min),
+    connectivity: asNumber(data.avg_connectivity),
     coordinates,
-    segments: data.segments ?? [],
-    signalSegments:
-      data.signal_segments?.map((segment: RouteSignalSegment) => ({
-        ...segment,
-        coordinates: segment.coordinates ?? [],
-      })) ?? [],
-    signalSource: normalizeSignalSource(data.signal_source ?? data.source),
-    towerCount: Number(data.tower_count ?? 0),
-    coveragePercent: Number(data.coverage_percent ?? data.real_data_percent ?? 0),
-    explanation: data.explanation ?? {
-      summary: "No explanation available",
-      factors: [],
-      score_breakdown: { connectivity: 0, speed: 0, risk: 0 },
-    },
+    segments: Array.isArray(data.segments) ? (data.segments as RouteSegment[]) : [],
+    signalSegments,
+    signalSource: displaySignalSource(provenanceSource),
+    provenanceSource,
+    towerCount: asNumber(data.tower_count),
+    routeSignalPercent: asPercent(
+      data.route_signal_percent ?? asNumber(data.avg_connectivity) * 100,
+    ),
+    realDataCoveragePercent: asPercent(
+      data.real_data_coverage_percent ?? data.coverage_percent ?? data.real_data_percent,
+    ),
+    goodSignalPercent: asPercent(data.good_signal_percent),
+    explanation:
+      validExplanation(data.explanation) ? data.explanation : {
+        summary: "No explanation available",
+        factors: [],
+        score_breakdown: { connectivity: 0, speed: 0, risk: 0 },
+      },
   };
+}
+
+function validCoordinates(value: unknown): value is [number, number] {
+  return Array.isArray(value) && value.length === 2 && value.every((item) => typeof item === "number" && Number.isFinite(item)) && Math.abs(value[0]) <= 90 && Math.abs(value[1]) <= 180;
+}
+
+function validExplanation(value: unknown): value is RouteExplanation {
+  const data = asObject(value);
+  const breakdown = asObject(data.score_breakdown);
+  return typeof data.summary === "string" && Array.isArray(data.factors) &&
+    data.factors.every((factor) => { const entry = asObject(factor); return typeof entry.factor === "string" && typeof entry.detail === "string" && ["positive", "negative"].includes(String(entry.impact)); }) &&
+    [breakdown.connectivity, breakdown.speed, breakdown.risk].every((score) => typeof score === "number" && Number.isFinite(score));
 }
 
 export function formatRouteForUI(route: RouteResponse, color: string): FormattedRoute {
@@ -450,18 +730,23 @@ export function formatRouteForUI(route: RouteResponse, color: string): Formatted
     connectivity: route.connectivity ?? 0,
     color,
     warning:
-      shouldWarnForMlFallback(route.signalSource)
-        ? "Signal data unavailable - using ML estimate"
-        : route.strategy === "fastest" && (route.connectivity ?? 0) < 0.5
-          ? "Low network coverage on some segments"
-          : undefined,
+      route.provenanceSource === "ml_synthetic"
+        ? "Estimated signal; measured coverage is unavailable"
+        : route.provenanceSource === "unknown"
+          ? "Signal data provenance is unavailable"
+          : route.strategy === "fastest" && (route.connectivity ?? 0) < 0.5
+            ? "Low network coverage on some segments"
+            : undefined,
     coordinates: route.coordinates,
     segments: route.segments,
     signalSegments: route.signalSegments,
     signalSource: route.signalSource,
+    provenanceSource: route.provenanceSource,
     towerCount: route.towerCount,
-    coveragePercent: route.coveragePercent,
-    signalDataLabel: formatSignalSourceLabel(route.signalSource, route.towerCount),
+    routeSignalPercent: route.routeSignalPercent,
+    realDataCoveragePercent: route.realDataCoveragePercent,
+    goodSignalPercent: route.goodSignalPercent,
+    signalDataLabel: formatSignalSourceLabel(route.provenanceSource, route.towerCount),
     explanation: route.explanation,
   };
 }
